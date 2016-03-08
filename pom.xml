@@ -9,7 +9,7 @@
 
   <name>xenon-parent</name>
   <description>
-    Xenon is both a set of software components and a service oriented design pattern. The runtime is
+    VMware Test - Xenon is both a set of software components and a service oriented design pattern. The runtime is
     implemented in Java and acts as the host for the lightweight, asynchronous services. The programming
     model is language agnostic (does not rely on Java specific constructs) so implementations in other
     languages are encouraged.
