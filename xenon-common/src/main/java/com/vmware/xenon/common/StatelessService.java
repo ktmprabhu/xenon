@@ -15,13 +15,16 @@ package com.vmware.xenon.common;
 
 import java.net.URI;
 import java.util.EnumSet;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import com.vmware.xenon.common.Operation.AuthorizationContext;
+import com.vmware.xenon.common.ServiceHost.ServiceNotFoundException;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.ServiceStats.ServiceStatLogHistogram;
 import com.vmware.xenon.common.jwt.Signer;
+import com.vmware.xenon.services.common.ServiceUriPaths;
 
 /**
  * Infrastructure use only. Minimal Service implementation. Core service implementations that do not
@@ -461,7 +464,7 @@ public class StatelessService implements Service {
             return;
         }
 
-        getHost().processPendingServiceAvailableOperations(this, null);
+        getHost().processPendingServiceAvailableOperations(this, null, false);
     }
 
     @Override
@@ -495,30 +498,54 @@ public class StatelessService implements Service {
     }
 
     public void logSevere(Throwable e) {
-        log(Level.SEVERE, "%s", Utils.toString(e));
+        doLogging(Level.SEVERE, () -> Utils.toString(e));
     }
 
     public void logSevere(String fmt, Object... args) {
-        log(Level.SEVERE, fmt, args);
+        doLogging(Level.SEVERE, () -> String.format(fmt, args));
+    }
+
+    public void logSevere(Supplier<String> messageSupplier) {
+        doLogging(Level.SEVERE, messageSupplier);
     }
 
     public void logInfo(String fmt, Object... args) {
-        log(Level.INFO, fmt, args);
+        doLogging(Level.INFO, () -> String.format(fmt, args));
+    }
+
+    public void logInfo(Supplier<String> messageSupplier) {
+        doLogging(Level.INFO, messageSupplier);
     }
 
     public void logFine(String fmt, Object... args) {
-        log(Level.FINE, fmt, args);
+        doLogging(Level.FINE, () -> String.format(fmt, args));
+    }
+
+    public void logFine(Supplier<String> messageSupplier) {
+        doLogging(Level.FINE, messageSupplier);
     }
 
     public void logWarning(String fmt, Object... args) {
-        log(Level.WARNING, fmt, args);
+        doLogging(Level.WARNING, () -> String.format(fmt, args));
     }
 
-    protected void log(Level level, String fmt, Object... args) {
+    public void logWarning(Supplier<String> messageSupplier) {
+        doLogging(Level.WARNING, messageSupplier);
+    }
+
+    public void log(Level level, String fmt, Object... args) {
+        doLogging(level, () -> String.format(fmt, args));
+    }
+
+    public void log(Level level, Supplier<String> messageSupplier) {
+        doLogging(level, messageSupplier);
+    }
+
+    protected void doLogging(Level level, Supplier<String> messageSupplier) {
         String uri = this.host != null && this.selfLink != null ? getUri().toString()
                 : this.getClass().getSimpleName();
         Logger lg = Logger.getLogger(this.getClass().getName());
-        Utils.log(lg, 3, uri, level, fmt, args);
+        Utils.log(lg, 3, uri, level, messageSupplier);
     }
 
     @Override
@@ -562,7 +589,7 @@ public class StatelessService implements Service {
         }
 
         if (micros > 0 && micros < Service.MIN_MAINTENANCE_INTERVAL_MICROS) {
-            log(Level.WARNING, "Maintenance interval %d is less than the minimum interval %d"
+            logWarning("Maintenance interval %d is less than the minimum interval %d"
                     + ", reducing to min interval", micros, Service.MIN_MAINTENANCE_INTERVAL_MICROS);
             micros = Service.MIN_MAINTENANCE_INTERVAL_MICROS;
         }
@@ -636,5 +663,112 @@ public class StatelessService implements Service {
         } else {
             throw new RuntimeException("Service not allowed to get system authorization context");
         }
+    }
+
+    /**
+     * @see #handleUiGet(String, Service, Operation)
+     * @param get
+     */
+    protected void handleUiGet(Operation get) {
+        handleUiGet(getSelfLink(), this, get);
+    }
+
+    /**
+     * This method does basic URL rewriting and forwards to the Ui service.
+     *
+     * Every request to /some/service/FILE gets forwarded to
+     * /user-interface/resources/${serviceClass}/FILE
+     * @param get
+     */
+    protected void handleUiGet(String selfLink, Service ownerService, Operation get) {
+        URI uri = get.getUri();
+        String requestUri = uri.getPath();
+        String uiResourcePath;
+
+        ServiceDocumentDescription desc = ownerService.getDocumentTemplate().documentDescription;
+        if (desc != null && desc.userInterfaceResourcePath != null) {
+            uiResourcePath = UriUtils.buildUriPath(ServiceUriPaths.UI_RESOURCES,
+                    desc.userInterfaceResourcePath);
+        } else {
+            uiResourcePath = Utils.buildUiResourceUriPrefixPath(ownerService);
+        }
+
+        if (requestUri.startsWith(uiResourcePath)) {
+            Exception e = new ServiceNotFoundException(UriUtils.buildUri(uri.getScheme(), uri.getHost(),
+                    uri.getPort(), uri.getPath().substring(uiResourcePath.length()), uri.getQuery()).toString());
+            ServiceErrorResponse r = Utils.toServiceErrorResponse(e);
+            r.statusCode = Operation.STATUS_CODE_NOT_FOUND;
+            r.stackTrace = null;
+
+            get.setStatusCode(Operation.STATUS_CODE_NOT_FOUND)
+                    .setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON)
+                    .fail(e, r);
+            return;
+        }
+
+        if (selfLink.equals(requestUri) && !UriUtils.URI_PATH_CHAR.equals(requestUri)) {
+            // no trailing /, redirect to a location with trailing /
+            get.setStatusCode(Operation.STATUS_CODE_MOVED_TEMP);
+            get.addResponseHeader(Operation.LOCATION_HEADER, selfLink + UriUtils.URI_PATH_CHAR);
+            get.complete();
+            return;
+        } else {
+            String relativeToSelfUri = UriUtils.URI_PATH_CHAR.equals(selfLink) ?
+                    requestUri : requestUri.substring(selfLink.length());
+            if (relativeToSelfUri.equals(UriUtils.URI_PATH_CHAR)) {
+                // serve the index.html
+                uiResourcePath += UriUtils.URI_PATH_CHAR + ServiceUriPaths.UI_RESOURCE_DEFAULT_FILE;
+            } else {
+                // serve whatever resource
+                uiResourcePath += relativeToSelfUri;
+            }
+        }
+
+        // Forward request to the /user-interface service
+        Operation operation = get.clone();
+        operation.setUri(UriUtils.buildUri(getHost(), uiResourcePath, uri.getQuery()))
+                .setCompletion((o, e) -> {
+                    get.setBody(o.getBodyRaw())
+                            .setStatusCode(o.getStatusCode())
+                            .setContentType(o.getContentType());
+                    if (e != null) {
+                        get.fail(e);
+                    } else {
+                        get.complete();
+                    }
+                });
+
+        getHost().sendRequest(operation);
+    }
+
+    /**
+     * Records the handler invocation time for an operation if the instrumentation option is
+     * set in the service.This method has to be called by the child class that extends the
+     * StatelessService once operation processing starts in the handler.
+     */
+    public void setOperationHandlerInvokeTimeStat(Operation request) {
+        if (!hasOption(Service.ServiceOption.INSTRUMENTATION)) {
+            return;
+        }
+        request.setHandlerInvokeTime(Utils.getNowMicrosUtc());
+    }
+
+    /**
+     * Updates the operation duration stat using the handler invocation time and the current time
+     * if the instrumentation option is set in the service.This method has to be called by the child
+     * class that extends the StatelessService once processing is completed to report the statistics
+     * for operation duration.
+     */
+    public void setOperationDurationStat(Operation request) {
+        if (!hasOption(Service.ServiceOption.INSTRUMENTATION)) {
+            return;
+        }
+        if (request.getInstrumentationContext() == null) {
+            return;
+        }
+        setStat(request.getAction() + STAT_NAME_OPERATION_DURATION,
+                Utils.getNowMicrosUtc()
+                        - request.getInstrumentationContext().handleInvokeTimeMicrosUtc);
+
     }
 }

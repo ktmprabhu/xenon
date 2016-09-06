@@ -13,6 +13,11 @@
 
 package com.vmware.xenon.common;
 
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+
 import com.vmware.xenon.services.common.QueryTask;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.QueryTerm;
@@ -22,6 +27,7 @@ public class ODataQueryVisitor {
     public enum BinaryVerb {
         AND("and"), OR("or"),
         EQ("eq"), NE("ne"), LT("lt"), LE("le"), GT("gt"), GE("ge"),
+        ALL("all"), ANY("any"),
         // we don't actually support these
         ADD("add"), SUB("sub"),
         MUL("mul"), DIV("div"), MODULO("mod");
@@ -37,8 +43,29 @@ public class ODataQueryVisitor {
         }
     }
 
+    private static final String DEFAULT_COLLECTION_ITEM_SEPARATOR = ";";
     private static final IllegalArgumentException LeftRightTypeException = new IllegalArgumentException(
             "left and right side type mismatch");
+
+    private static final List<BinaryVerb> NON_NUMERIC_COMPARISON_OPERATORS = Arrays.asList(
+            BinaryVerb.EQ, BinaryVerb.NE,
+            BinaryVerb.ALL, BinaryVerb.ANY);
+
+    private Set<String> wildcardUnfoldPropertyNames;
+
+    public ODataQueryVisitor() {
+        this(Collections.emptySet());
+    }
+
+    /**
+     * Constructs ODataQueryVisitor with optional set of property names that will be used when we
+     * visit a term property name matching {@link UriUtils#URI_WILDCARD_CHAR}. In this case
+     * the query will be expanded with multiple OR sub-queries for each property name of
+     * {@link #wildcardUnfoldPropertyNames} instead of the wildcard.
+     */
+    public ODataQueryVisitor(Set<String> wildcardUnfoldPropertyNames) {
+        this.wildcardUnfoldPropertyNames = wildcardUnfoldPropertyNames;
+    }
 
     public Query toQuery(String filterExp) {
         ODataTokenizer tokenizer = new ODataTokenizer(filterExp);
@@ -83,7 +110,7 @@ public class ODataQueryVisitor {
 
         if (tokens.hasNext()
                 && tokens.lookToken().getKind().equals(ODataToken.ODataTokenKind.BINARY_OPERATOR)) {
-            left = visitBinary(left, stringToVerb(tokens.next().getUriLiteral()),
+            left = visitBinaryOperator(left, stringToVerb(tokens.next().getUriLiteral()),
                     walkTokens(tokens, null));
         }
 
@@ -122,12 +149,12 @@ public class ODataQueryVisitor {
             throw new IllegalArgumentException("Term mismatch");
         }
 
-        return visitBinary(left.getUriLiteral(), stringToVerb(verb.getUriLiteral()),
+        return visitBinaryComparator(left.getUriLiteral(), stringToVerb(verb.getUriLiteral()),
                 right.getUriLiteral());
     }
 
-    // Either return a unary query term, or a query term with 2 boolean queries (which may have other queries within).
-    private Query visitBinary(final Object leftSide,
+    // return a unary query term.
+    private Query visitBinaryComparator(final Object leftSide,
             final BinaryVerb operator,
             final Object rightSide) {
 
@@ -136,46 +163,121 @@ public class ODataQueryVisitor {
         // handle the operator by setting the query occurance.
         q.occurance = convertToLuceneOccur(operator);
 
-        // Handle a nested query. We return a query with left and right attached as boolean queries.
-        if (leftSide instanceof Query) {
-            if (!(rightSide instanceof Query)) {
-                throw LeftRightTypeException;
-            }
-            q.addBooleanClause((Query) leftSide);
-            q.addBooleanClause((Query) rightSide);
-            return q;
-        }
-
-        // If the left side is a String, the right side can only be a String or a Range.
-        // If the left side is a Query, the right side can only be a Query.
         if (rightSide instanceof Query) {
             throw LeftRightTypeException;
         }
-        q.setTermPropertyName((String) leftSide);
 
-        if (((String) leftSide).contains(UriUtils.URI_WILDCARD_CHAR)) {
-            q.setTermMatchType(QueryTerm.MatchType.WILDCARD);
+        if (isUnfoldQuery(leftSide, operator, rightSide)) {
+            for (String name : this.wildcardUnfoldPropertyNames) {
+                Query innerQuery = visitBinaryComparator(name, operator, rightSide);
+                innerQuery.occurance = Query.Occurance.SHOULD_OCCUR;
+                q.addBooleanClause(innerQuery);
+            }
+
+            return q;
         }
 
         if (rightSide instanceof String) {
-            // Handle numeric ranges
-            if (isNumeric((String) rightSide)) {
-                // create a rangeA
-                QueryTask.NumericRange<?> r = createRange(rightSide.toString(), operator);
-                q.setNumericRange(r);
-
+            if (operator == BinaryVerb.ANY || operator == BinaryVerb.ALL) {
+                Query.Occurance itemOccurance = Query.Occurance.MUST_OCCUR;
+                if (operator == BinaryVerb.ANY) {
+                    itemOccurance = Query.Occurance.SHOULD_OCCUR;
+                }
+                String[] itemNames = ((String) rightSide).split(DEFAULT_COLLECTION_ITEM_SEPARATOR);
+                for (String itemName : itemNames) {
+                    if (!itemName.isEmpty()) {
+                        Query itemClause = new Query();
+                        itemClause.setTermPropertyName((String) leftSide);
+                        itemClause.occurance = itemOccurance;
+                        itemClause.setTermMatchValue(itemName.replace("\'", "").trim());
+                        if (itemName.contains(UriUtils.URI_WILDCARD_CHAR)) {
+                            itemClause.setTermMatchType(QueryTerm.MatchType.WILDCARD);
+                        }
+                        q.addBooleanClause(itemClause);
+                    }
+                }
             } else {
-                q.setTermMatchValue(((String) rightSide).replace("\'", ""));
+                q.setTermPropertyName((String) leftSide);
 
-                if (((String) rightSide).contains("*")) {
+                if (((String) leftSide).contains(UriUtils.URI_WILDCARD_CHAR)) {
                     q.setTermMatchType(QueryTerm.MatchType.WILDCARD);
                 }
-            }
+                // Handle numeric ranges
+                if (isNumeric((String) rightSide)) {
+                    // create a rangeA
+                    QueryTask.NumericRange<?> r = createRange(rightSide.toString(), operator);
+                    q.setNumericRange(r);
 
+                } else {
+                    q.setTermMatchValue(((String) rightSide).replace("\'", ""));
+
+                    if (((String) rightSide).contains("*")) {
+                        q.setTermMatchType(QueryTerm.MatchType.WILDCARD);
+                    }
+                }
+            }
         } else {
             // We don't know what type this is.
             throw LeftRightTypeException;
         }
+
+        return q;
+    }
+
+    // Return a query term with 2 boolean queries (which may have other queries within).
+    private Query visitBinaryOperator(final Query leftSide,
+            final BinaryVerb operator,
+            final Query rightSide) {
+
+        Query q = new Query();
+
+        switch (operator) {
+        case AND:
+            /*
+             * AND will set the left, right queries to MUST
+             * unless already set MUST_NOT
+             */
+            if (leftSide.occurance != Query.Occurance.MUST_NOT_OCCUR) {
+                leftSide.occurance = Query.Occurance.MUST_OCCUR;
+            }
+
+            if (rightSide.occurance != Query.Occurance.MUST_NOT_OCCUR) {
+                rightSide.occurance = Query.Occurance.MUST_OCCUR;
+            }
+
+            if (leftSide.occurance == Query.Occurance.MUST_NOT_OCCUR &&
+                    rightSide.occurance == Query.Occurance.MUST_NOT_OCCUR) {
+                q.occurance = Query.Occurance.MUST_NOT_OCCUR;
+                leftSide.occurance = Query.Occurance.SHOULD_OCCUR;
+                rightSide.occurance = Query.Occurance.SHOULD_OCCUR;
+            }
+            break;
+        case OR:
+            /*
+             * OR will set the left, right queries to SHOULD
+             * unless already set to MUST_NOT
+             */
+            if (leftSide.occurance != Query.Occurance.MUST_NOT_OCCUR) {
+                leftSide.occurance = Query.Occurance.SHOULD_OCCUR;
+            }
+
+            if (rightSide.occurance != Query.Occurance.MUST_NOT_OCCUR) {
+                rightSide.occurance = Query.Occurance.SHOULD_OCCUR;
+            }
+
+            if (leftSide.occurance == Query.Occurance.MUST_NOT_OCCUR &&
+                    rightSide.occurance == Query.Occurance.MUST_NOT_OCCUR) {
+                q.occurance = Query.Occurance.MUST_NOT_OCCUR;
+                leftSide.occurance = Query.Occurance.MUST_OCCUR;
+                rightSide.occurance = Query.Occurance.MUST_OCCUR;
+            }
+            break;
+        default:
+            break;
+        }
+
+        q.addBooleanClause(leftSide);
+        q.addBooleanClause(rightSide);
 
         return q;
     }
@@ -207,6 +309,8 @@ public class ODataQueryVisitor {
         case GE:
         case LT:
         case LE:
+        case ANY:
+        case ALL:
             return Query.Occurance.MUST_OCCUR;
         default:
             throw new IllegalArgumentException("unsupported operation");
@@ -262,5 +366,12 @@ public class ODataQueryVisitor {
         }
 
         return null;
+    }
+
+    private static boolean isUnfoldQuery(final Object leftSide, final BinaryVerb operator,
+            final Object rightSide) {
+        return ODataUtils.FILTER_VALUE_ALL_FIELDS.equals(leftSide)
+                && NON_NUMERIC_COMPARISON_OPERATORS.contains(operator)
+                && (rightSide instanceof String) && !isNumeric((String) rightSide);
     }
 }

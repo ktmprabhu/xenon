@@ -17,6 +17,7 @@ import java.net.URI;
 import java.util.EnumSet;
 import java.util.concurrent.TimeUnit;
 
+import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 
 public interface Service extends ServiceRequestSender {
@@ -75,7 +76,8 @@ public interface Service extends ServiceRequestSender {
          * The runtime will route requests to the owner, regardless to which node receives a client
          * request.
          *
-         * These service handlers are invoked only on the service instance on the owner node:
+         * These service handlers are invoked only
+         * on the service instance on the owner node:
          * handleStart, handleMaintenance, handleGet, handleDelete, handlePut, handlePatch
          *
          * Service instances (replicas) on the other nodes will see replicated updates, as part of the
@@ -192,12 +194,16 @@ public interface Service extends ServiceRequestSender {
          */
         FACTORY_ITEM,
 
-
         /**
          * Set by runtime. Service is currently assigned ownership of the replicated document. Any
          * work initiated through an update should only happen on this instance
          */
         DOCUMENT_OWNER,
+
+        /**
+         * Set by runtime. Service has one or more pending transactions.
+         */
+        TRANSACTION_PENDING,
 
         NONE
     }
@@ -290,10 +296,13 @@ public interface Service extends ServiceRequestSender {
     static final String STAT_NAME_SERVICE_HANDLER_LATENCY = "operationHandlerProcessingLatencyMicros";
     static final String STAT_NAME_CREATE_COUNT = "createCount";
     static final String STAT_NAME_OPERATION_DURATION = "operationDuration";
+    static final String STAT_NAME_SERVICE_HOST_MAINTENANCE_COUNT = "hostMaintenanceCount";
     static final String STAT_NAME_MAINTENANCE_COUNT = "maintenanceCount";
     static final String STAT_NAME_NODE_GROUP_CHANGE_MAINTENANCE_COUNT = "maintenanceForNodeGroupChangeCount";
     static final String STAT_NAME_NODE_GROUP_SYNCH_DELAYED_COUNT = "maintenanceForNodeGroupDelayedCount";
     static final String STAT_NAME_MAINTENANCE_COMPLETION_DELAYED_COUNT = "maintenanceCompletionDelayedCount";
+    static final String STAT_NAME_DOCUMENT_OWNER_TOGGLE_ON_MAINT_COUNT = "maintenanceDocumentOwnerToggleOnCount";
+    static final String STAT_NAME_DOCUMENT_OWNER_TOGGLE_OFF_MAINT_COUNT = "maintenanceDocumentOwnerToggleOffCount";
     static final String STAT_NAME_CACHE_MISS_COUNT = "stateCacheMissCount";
     static final String STAT_NAME_CACHE_CLEAR_COUNT = "stateCacheClearCount";
     static final String STAT_NAME_VERSION_CONFLICT_COUNT = "stateVersionConflictCount";
@@ -481,4 +490,7 @@ public interface Service extends ServiceRequestSender {
 
     ServiceDocument getDocumentTemplate();
 
+    AuthorizationContext getSystemAuthorizationContext();
+
+    void setAuthorizationContext(Operation op, AuthorizationContext ctx);
 }

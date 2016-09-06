@@ -54,9 +54,6 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
             FullHttpResponse response = (FullHttpResponse) msg;
 
             Operation request = findOperation(ctx, response);
-            if (request == null) {
-                return;
-            }
             request.setStatusCode(response.status().code());
             parseResponseHeaders(request, response);
             completeRequest(ctx, request, response.content());
@@ -127,6 +124,11 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
         for (Entry<String, String> h : headers) {
             String key = h.getKey();
             String value = h.getValue();
+            if (Operation.STREAM_ID_HEADER.equals(key)) {
+                // Prevent allocation of response headers in Operation and hide the stream ID
+                // header, since it is manipulated by the HTTP layer, not services
+                continue;
+            }
             request.addResponseHeader(key, value);
         }
     }
@@ -152,6 +154,9 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
                 request.fail(e);
                 return;
             }
+            if (checkResponseForError(request)) {
+                return;
+            }
             completeRequest(request);
         });
 
@@ -167,7 +172,6 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        this.logger.warning(Utils.toString(cause));
         Operation request = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).get();
 
         if (request == null) {
@@ -175,8 +179,8 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
             // associated with the channel. For now, we're just logging, but we could
             // find all the requests and fail all of them. That's slightly risky because
             // we don't understand why we failed, and we may get responses for them later.
-            Logger.getAnonymousLogger().info(
-                    "Channel exception but no HTTP/1.1 request to fail" + cause.getMessage());
+            this.logger.info(
+                    "Channel exception but no HTTP/1.1 request to fail:" + cause.getMessage());
             return;
         }
 

@@ -11,7 +11,7 @@
  * specific language governing permissions and limitations under the License.
  */
 
-package client
+package main
 
 import (
 	"encoding/json"
@@ -81,8 +81,10 @@ func (s *TestServiceHost) readState() error {
 }
 
 func (s *TestServiceHost) poll() error {
-	timer := time.NewTimer(time.Second * 10)
+	timer := time.NewTimer(time.Minute)
 	ticker := time.NewTicker(time.Millisecond * 100)
+	http.DefaultClient.Timeout = time.Second * 10
+
 	defer ticker.Stop()
 
 	for {

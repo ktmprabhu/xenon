@@ -36,6 +36,9 @@ public class ServiceUriPaths {
     public static final String PROCESS_LOG = CORE_MANAGEMENT + "/process-log";
     public static final String GO_PROCESS_LOG = CORE_MANAGEMENT + "/go-dcp-process-log";
     public static final String SYSTEM_LOG = CORE_MANAGEMENT + "/system-log";
+    public static final String MIGRATION_TASKS = MANAGEMENT + "/migration-tasks";
+
+    public static final String CORE_PROCESSES = CORE + "/processes";
 
     public static final String COORDINATED_UPDATE_FACTORY = CORE + "/coordinated-updates";
     public static final String NODE_GROUP_FACTORY = CORE + "/node-groups";
@@ -45,11 +48,10 @@ public class ServiceUriPaths {
 
     public static final String NODE_SELECTOR_PREFIX = CORE + "/node-selectors";
     public static final String DEFAULT_NODE_SELECTOR_NAME = "default";
-    public static final String SHA1_NODE_SELECTOR_NAME = "sha1-hash";
     public static final String DEFAULT_NODE_SELECTOR = NODE_SELECTOR_PREFIX + "/"
             + DEFAULT_NODE_SELECTOR_NAME;
-    public static final String SHA1_3X_NODE_SELECTOR = NODE_SELECTOR_PREFIX + "/"
-            + SHA1_NODE_SELECTOR_NAME + "-3x";
+    public static final String DEFAULT_3X_NODE_SELECTOR = NODE_SELECTOR_PREFIX + "/"
+            + DEFAULT_NODE_SELECTOR_NAME + "-3x";
 
     public static final String CORE_AUTH = CORE + "/auth";
     public static final String CORE_CREDENTIALS = CORE_AUTH + "/credentials";
@@ -63,6 +65,13 @@ public class ServiceUriPaths {
 
     public static final String CORE_QUERY_TASKS = UriUtils.buildUriPath(ServiceUriPaths.CORE,
             "query-tasks");
+
+    public static final String CORE_QUERY_PAGE = UriUtils.buildUriPath(ServiceUriPaths.CORE,
+            "query-page");
+
+    public static final String CORE_GRAPH_QUERIES = UriUtils.buildUriPath(ServiceUriPaths.CORE,
+            "graph-queries");
+
     public static final String ODATA_QUERIES = UriUtils.buildUriPath(ServiceUriPaths.CORE,
             "odata-queries");
 
@@ -106,4 +115,9 @@ public class ServiceUriPaths {
     public static final String WS_SERVICE_LIB_JS_PATH =
             Utils.buildUiResourceUriPrefixPath(WebSocketService.class) + "/ws-service-lib.js";
 
+    /**
+     * Swagger discovery service is started on this URI.
+     * @see com.vmware.xenon.swagger.SwaggerDescriptorService
+     */
+    public static final String SWAGGER = "/discovery/swagger";
 }

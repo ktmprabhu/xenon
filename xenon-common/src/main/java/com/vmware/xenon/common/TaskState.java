@@ -67,15 +67,76 @@ public class TaskState {
      */
     public Long durationMicros;
 
+    public static TaskState create() {
+        TaskState state = new TaskState();
+        state.stage = TaskStage.CREATED;
+        return state;
+    }
+
+    public static TaskState createDirect() {
+        TaskState state = new TaskState();
+        state.stage = TaskStage.CREATED;
+        state.isDirect = true;
+        return state;
+    }
+
+    public static TaskState createAsStarted() {
+        TaskState state = new TaskState();
+        state.stage = TaskStage.STARTED;
+        return state;
+    }
+
+    public static TaskState createAsFinished() {
+        TaskState state = new TaskState();
+        state.stage = TaskStage.FINISHED;
+        return state;
+    }
+
+    public static TaskState createAsCancelled() {
+        TaskState state = new TaskState();
+        state.stage = TaskStage.CANCELLED;
+        return state;
+    }
+
+    public static TaskState createAsFailed() {
+        TaskState state = new TaskState();
+        state.stage = TaskStage.FAILED;
+        return state;
+    }
+
     public static boolean isFailed(TaskState taskInfo) {
+        if (taskInfo == null) {
+            return false;
+        }
         return taskInfo.stage == TaskStage.FAILED;
     }
 
+    public static boolean isCreated(TaskState taskInfo) {
+        if (taskInfo == null) {
+            return false;
+        }
+        return taskInfo.stage == TaskStage.CREATED;
+    }
+
+    public static boolean isInProgress(TaskState taskInfo) {
+        if (taskInfo == null) {
+            return false;
+        }
+        return taskInfo.stage == TaskStage.CREATED
+                || taskInfo.stage == TaskStage.STARTED;
+    }
+
     public static boolean isFinished(TaskState taskInfo) {
+        if (taskInfo == null) {
+            return false;
+        }
         return taskInfo.stage == TaskStage.FINISHED;
     }
 
     public static boolean isCancelled(TaskState taskInfo) {
+        if (taskInfo == null) {
+            return false;
+        }
         return taskInfo.stage == TaskStage.CANCELLED;
     }
 }

@@ -1,10 +1,13 @@
 GOVENDORCOMMON := $(CURDIR)/../../../../xenon-common/src/main/go/_vendor/
 GOVENDOR :=$(CURDIR)/_vendor
+TMPDIR :=$(CURDIR)/_tmp
 GOPATH := $(GOVENDOR):$(GOVENDORCOMMON):$(CURDIR)
+GOBIN := $(GOVENDORCOMMON)/bin
 GO ?= go
 OS := $(shell uname)
 GO1.5 ?= go1.5
 GO1.6 ?= go1.6
+GO1.7 ?= go1.7
 
 ifeq ($(OS), Linux)
 CGO_ENABLED = 0
@@ -14,6 +17,7 @@ endif
 FOUND_GO = $(shell $(GO) version)
 export FOUND_GO
 export GOPATH
+export TMPDIR
 
 all: deps verify test
 
@@ -33,7 +37,7 @@ endif
 
 ifneq ($(FOUND_GO),)
 goversion:
-	@( $(GO) version | grep -q '$(GO1.5)\|$(GO1.6)' ) || ( echo "Please install $(GO1.5) or $(GO1.6) to build this module (found: $$($(GO) version))" && exit 1 )
+	@( $(GO) version | grep -q '$(GO1.5)\|$(GO1.6)\|$(GO1.7)' ) || ( echo "Please install $(GO1.5), $(GO1.6) or $(GO1.7) to build this module (found: $$($(GO) version))" && exit 1 )
 else
 goversion:
 endif
@@ -44,10 +48,6 @@ goimports:
 	@! $(GOVENDORCOMMON)/bin/goimports -d src 2>&1 | egrep -v '^$$'
 
 govet:
-	@if [ -w "$(shell $(GO) env GOTOOLDIR)" ] ; then \
-		echo "$(GO) install golang.org/x/tools/cmd/vet"; \
-		$(GO) install golang.org/x/tools/cmd/vet; \
-	fi;
 	@echo checking go vet...
 	@! $(GO) vet ./... 2>&1 | egrep -v '^$$'
 

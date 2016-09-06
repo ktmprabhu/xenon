@@ -18,13 +18,14 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.common.ServiceDocumentQueryResult;
 import com.vmware.xenon.common.TaskState;
 import com.vmware.xenon.common.Utils;
-import com.vmware.xenon.services.common.QueryTask.Query.Occurance;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification.SortOrder;
 import com.vmware.xenon.services.common.QueryTask.QueryTerm.MatchType;
@@ -38,11 +39,6 @@ public class QueryTask extends ServiceDocument {
      * {@link NumericRange#precisionStep}.
      */
     public static final int DEFAULT_PRECISION_STEP = 16;
-
-    /**
-     * A list of tenant links which can access this service.
-     */
-    public List<String> tenantLinks;
 
     public static class QuerySpecification {
         public static final String FIELD_NAME_CHARACTER = ".";
@@ -58,6 +54,11 @@ public class QueryTask extends ServiceDocument {
             public transient Object nativeSearcher;
             public transient Object nativeSort;
             public transient QueryFilter filter;
+            /**
+             * Set of document links that should be considered in query execution. Any document not
+             * in the list must be discarded. This is an implementation specific hint
+             */
+            public transient Set<String> documentLinkWhiteList;
         }
 
         public enum QueryOption {
@@ -70,7 +71,8 @@ public class QueryTask extends ServiceDocument {
 
             /**
              * Query results will return the number of documents that satisfy the query and populate the
-             * the {@link results.documentCount} field. The results will not contain links or documents
+             * the {@link ServiceDocumentQueryResult#documentCount} field. The results will not contain
+             * links or documents
              */
             COUNT,
 
@@ -87,13 +89,23 @@ public class QueryTask extends ServiceDocument {
             TOP_RESULTS,
 
             /**
-             * Query results will include the state documents in the {@link results.documents} collection
+             * Query results will include the state documents in the {@link ServiceDocumentQueryResult#documents}
+             * collection
              */
             EXPAND_CONTENT,
 
             /**
+             * Query execution will issue GET requests to the document links in each document in
+             * the results. The content will be placed in the
+             * {@code ServiceDocumentQueryResult#selectedDocuments} map.
+             * This option must be combined with SELECT_LINKS
+             */
+            EXPAND_LINKS,
+
+            /**
              * The query will execute over all document versions, not just the latest per self link. Each
-             * document self link will be annotated with the version
+             * document self link will be annotated with the version. Document versions marked
+             * deleted will also be included
              */
             INCLUDE_ALL_VERSIONS,
 
@@ -113,9 +125,27 @@ public class QueryTask extends ServiceDocument {
             TASK,
 
             /**
-             * Need to broadcast this task to all nodes
+             * Broadcast the query to each node, using the local query task factory.
+             * It then merges results from each node. See related option @{code QueryOption.OWNER_SELECTION}
              */
             BROADCAST,
+
+            /**
+             * Filters query results based on the document owner ID.
+             * If the owner ID of the document does not match the ID of the host executing the query,
+             * the document is removed from the result
+             */
+            OWNER_SELECTION,
+
+            /**
+             * Query results include the values for all fields marked with {@code PropertyUsageOption#LINK}
+             */
+            SELECT_LINKS,
+
+            /**
+             * Groups results using the {@link QuerySpecification#groupByTerms}
+             */
+            GROUP_BY
         }
 
         public enum SortOrder {
@@ -127,25 +157,61 @@ public class QueryTask extends ServiceDocument {
          */
         public Query query = new Query();
 
+        /**
+         * Property names of fields annotated with PropertyUsageOption.LINK. Used in combination with
+         * {@code QueryOption#SELECT_LINKS}
+         */
+        public List<QueryTerm> linkTerms;
+
+        /**
+         * Property name to use for primary sort. Used in combination with {@code QueryOption#SORT}
+         */
         public QueryTerm sortTerm;
 
+        /**
+         * Property name to use for group sort. Used in combination with {@code QueryOption#GROUP_BY}
+         */
+        public QueryTerm groupSortTerm;
+
+        /**
+         * Property name to use for grouping. Used in combination with {@code QueryOption#GROUP_BY}
+         */
+        public QueryTerm groupByTerm;
+
+        /**
+         * Primary sort order. Used in combination with {@code QueryOption#SORT}
+         */
         public SortOrder sortOrder;
 
         /**
-         * The optional resultLimit field is used to enable query results pagination. When
-         * resultLimit is set, the query task will not return any results when finished, but will
-         * include a nextPageLink field. A client can then issue a GET request on the nextPageLink
-         * to get the first page of results. A nextPageLink field will be included in GET response
-         * documents until all query results have been consumed.
+         * Group sort order. Used in combination with {@code QueryOption#GROUP_BY}
+         */
+        public SortOrder groupSortOrder;
+
+        /**
+         * Used for query results pagination. When specified,
+         * the query task documentLinks and documents will remain empty, but when results are available
+         * the nextPageLink field will be set. A client can then issue a GET request on the nextPageLink
+         * to get the first page of results. If additional results are available, each result page will
+         * have its nextPageLink set.
          */
         public Integer resultLimit;
 
         /**
-         * The optional expectedResultCount field will enable query retries until
-         * expectedResultCount is met or the QueryTask expires. taskInfo.stage will remain in the
-         * STARTED phase until such time.
+         * Used for grouped result pagination, limiting the number of entries in
+         * {@link ServiceDocumentQueryResult#nextPageLinksPerGroup}
+         */
+        public Integer groupResultLimit;
+
+        /**
+         * The query is retried until the result count matches the
+         * specified value or the query expires.
          */
         public Long expectedResultCount;
+
+        /**
+         * A set of options that determine query behavior
+         */
         public EnumSet<QueryOption> options = EnumSet.noneOf(QueryOption.class);
 
         /**
@@ -167,6 +233,11 @@ public class QueryTask extends ServiceDocument {
 
         public static String buildCollectionItemName(String fieldName) {
             return fieldName + FIELD_NAME_CHARACTER + COLLECTION_FIELD_SUFFIX;
+        }
+
+        public static String buildLinkCollectionItemName(String fieldName, int ordinal) {
+            return fieldName + FIELD_NAME_CHARACTER
+                    + COLLECTION_FIELD_SUFFIX + FIELD_NAME_CHARACTER + ordinal;
         }
 
         /**
@@ -204,34 +275,32 @@ public class QueryTask extends ServiceDocument {
             return value == null ? null : value.name();
         }
 
-        /**
-         * Use the Query.Builder instead.
-         */
-        @Deprecated
-        public static void buildListValueClause(QueryTask q, String propName,
-                Collection<String> values) {
-            QueryTask.Query inClause = new QueryTask.Query();
-            for (String value : values) {
-                QueryTask.Query clause = new QueryTask.Query()
-                        .setTermPropertyName(propName)
-                        .setTermMatchValue(value);
-
-                clause.occurance = Occurance.SHOULD_OCCUR;
-                inClause.addBooleanClause(clause);
-                if (values.size() == 1) {
-                    // if we only have one value then change it to single value clause.
-                    inClause = clause;
-                    inClause.occurance = Occurance.MUST_OCCUR;
-                }
-            }
-
-            q.querySpec.query.addBooleanClause(inClause);
-        }
-
         public static QueryTask addExpandOption(QueryTask queryTask) {
             queryTask.querySpec.options = EnumSet
                     .of(QueryTask.QuerySpecification.QueryOption.EXPAND_CONTENT);
             return queryTask;
+        }
+
+        /**
+         * Performs shallow copy of this instance to the supplied instance
+         */
+        public void copyTo(QuerySpecification clonedSpec) {
+            clonedSpec.context.documentLinkWhiteList = this.context.documentLinkWhiteList;
+            clonedSpec.context.filter = this.context.filter;
+            clonedSpec.context.nativePage = this.context.nativePage;
+            clonedSpec.context.nativeQuery = this.context.nativeQuery;
+            clonedSpec.context.nativeSearcher = this.context.nativeSearcher;
+            clonedSpec.context.nativeSort = this.context.nativeSort;
+            clonedSpec.expectedResultCount = this.expectedResultCount;
+            clonedSpec.linkTerms = this.linkTerms;
+            clonedSpec.groupByTerm = this.groupByTerm;
+            clonedSpec.options = EnumSet.copyOf(this.options);
+            clonedSpec.query = this.query;
+            clonedSpec.resultLimit = this.resultLimit;
+            clonedSpec.sortOrder = this.sortOrder;
+            clonedSpec.sortTerm = this.sortTerm;
+            clonedSpec.groupSortTerm = this.groupSortTerm;
+            clonedSpec.groupSortOrder = this.groupSortOrder;
         }
     }
 
@@ -326,6 +395,27 @@ public class QueryTask extends ServiceDocument {
             }
             return createLongRange((Long) num, (Long) num, true, true);
         }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (obj != null && obj instanceof NumericRange<?>) {
+                NumericRange<?> nObj = (NumericRange<?>)obj;
+                if ((this.isMaxInclusive == nObj.isMaxInclusive)
+                        && (this.isMinInclusive == nObj.isMinInclusive)
+                        && Objects.equals(this.max, nObj.max)
+                        && Objects.equals(this.min, nObj.min)
+                        && Objects.equals(this.precisionStep, nObj.precisionStep)
+                        && Objects.equals(this.type, nObj.type)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(this.max, this.min, this.precisionStep, this.type);
+        }
     }
 
     public static class QueryTerm {
@@ -338,6 +428,26 @@ public class QueryTask extends ServiceDocument {
         public String matchValue;
         public MatchType matchType;
         public NumericRange<?> range;
+
+        @Override
+        public boolean equals(Object obj) {
+            if (obj != null && obj instanceof QueryTerm) {
+                QueryTerm qObj = (QueryTerm)obj;
+                if (Objects.equals(this.propertyName, qObj.propertyName)
+                        && Objects.equals(this.propertyType, qObj.propertyType)
+                        && Objects.equals(this.matchType, qObj.matchType)
+                        && Objects.equals(this.matchValue, qObj.matchValue)
+                        && Objects.equals(this.range, qObj.range)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(this.propertyName, this.propertyType, this.matchType, this.matchValue, this.range);
+        }
     }
 
     public static class Query {
@@ -389,7 +499,8 @@ public class QueryTask extends ServiceDocument {
              * @param occurance the occurance for this clause.
              * @return a reference to this object.
              */
-            public Builder addKindFieldClause(Class<? extends ServiceDocument> documentClass, Occurance occurance) {
+            public Builder addKindFieldClause(Class<? extends ServiceDocument> documentClass,
+                    Occurance occurance) {
                 return addFieldClause(FIELD_NAME_KIND, Utils.buildKind(documentClass), occurance);
             }
 
@@ -412,7 +523,8 @@ public class QueryTask extends ServiceDocument {
              * @param occurance the occurance for this clause.
              * @return a reference to this object.
              */
-            public Builder addCollectionItemClause(String collectionFieldName, String itemName, Occurance occurance) {
+            public Builder addCollectionItemClause(String collectionFieldName, String itemName,
+                    Occurance occurance) {
                 return addFieldClause(
                         QuerySpecification.buildCollectionItemName(collectionFieldName),
                         itemName,
@@ -432,17 +544,19 @@ public class QueryTask extends ServiceDocument {
 
             /**
              * Add a clause with the given occurance which matches a property with at least one of several specified
-             * values (analogous to a SQL "IN" statement).
+             * values (analogous to a SQL "IN" or "NOT IN" statements).
              * @param fieldName the field name.
              * @param itemNames the item names in the collection to match.
              * @param occurance the occurance for this clause.
              * @return a reference to this object.
              */
-            public Builder addInClause(String fieldName, Collection<String> itemNames, Occurance occurance) {
+            public Builder addInClause(String fieldName, Collection<String> itemNames,
+                    Occurance occurance) {
                 if (itemNames.size() == 1) {
                     return addFieldClause(
                             fieldName,
-                            itemNames.iterator().next());
+                            itemNames.iterator().next(),
+                            occurance);
                 }
 
                 Query.Builder inClause = Query.Builder.create(occurance);
@@ -455,7 +569,7 @@ public class QueryTask extends ServiceDocument {
 
             /**
              * Add a clause which matches a collection containing at least one of several specified
-             * values (analogous to a SQL "IN" statement).
+             * values (analogous to a SQL "IN" or "NOT IN" statements).
              * @param collectionFieldName the collection field name.
              * @param itemNames the item names in the collection to match.
              * @return a reference to this object.
@@ -469,7 +583,7 @@ public class QueryTask extends ServiceDocument {
 
             /**
              * Add a clause with the given occurance which matches a collection containing at least one of several
-             * specified values (analogous to a SQL "IN" statement).
+             * specified values (analogous to a SQL "IN" or "NOT IN" statements).
              * @param collectionFieldName the collection field name.
              * @param itemNames the item names in the collection to match.
              * @param occurance the occurance for this clause.
@@ -489,7 +603,8 @@ public class QueryTask extends ServiceDocument {
              * @param nestedFieldValue the nested field value to match.
              * @return a reference to this object.
              */
-            public Builder addCompositeFieldClause(String parentFieldName, String nestedFieldName, String nestedFieldValue) {
+            public Builder addCompositeFieldClause(String parentFieldName, String nestedFieldName,
+                    String nestedFieldValue) {
                 return addFieldClause(
                         QuerySpecification.buildCompositeFieldName(parentFieldName, nestedFieldName),
                         nestedFieldValue);
@@ -581,6 +696,27 @@ public class QueryTask extends ServiceDocument {
             }
 
             /**
+             * Add a clause which matches a top level field name with the provided {@link MatchType} and
+             * {@link Occurance}.
+             * @param fieldName the top level field name.
+             * @param fieldValue the field value to match, first converted so it can match in a case insensitive way
+             * @param matchType the match type.
+             * @param occurance the {@link Occurance} for this clause.
+             * @return a reference to this object.
+             */
+            public Builder addCaseInsensitiveFieldClause(String fieldName, String fieldValue,
+                    MatchType matchType,
+                    Occurance occurance) {
+                Query clause = new Query()
+                        .setTermPropertyName(fieldName)
+                        .setCaseInsensitiveTermMatchValue(fieldValue)
+                        .setTermMatchType(matchType);
+                clause.occurance = occurance;
+                this.query.addBooleanClause(clause);
+                return this;
+            }
+
+            /**
              * Set the term.
              *
              * This is only appropriate if you need to query on exactly a single clause and
@@ -633,7 +769,8 @@ public class QueryTask extends ServiceDocument {
              * @param occurance the {@link Occurance} for this clause.
              * @return a reference to this object.
              */
-            public Builder addRangeClause(String fieldName, NumericRange<?> range, Occurance occurance) {
+            public Builder addRangeClause(String fieldName, NumericRange<?> range,
+                    Occurance occurance) {
                 Query clause = new Query()
                         .setTermPropertyName(fieldName)
                         .setNumericRange(range);
@@ -704,8 +841,15 @@ public class QueryTask extends ServiceDocument {
             return this;
         }
 
+        public Query setCaseInsensitiveTermMatchValue(String matchValue) {
+            return setTermMatchValue(matchValue.toLowerCase());
+        }
+
         public Query setTermMatchValue(String matchValue) {
             allocateTerm();
+            if (this.term.matchType == null) {
+                this.term.matchType = MatchType.TERM;
+            }
             this.term.matchValue = matchValue;
             return this;
         }
@@ -713,6 +857,11 @@ public class QueryTask extends ServiceDocument {
         public Query setTermMatchType(MatchType matchType) {
             allocateTerm();
             this.term.matchType = matchType;
+            return this;
+        }
+
+        public Query setOccurance(Occurance occur) {
+            this.occurance = occur;
             return this;
         }
 
@@ -739,6 +888,14 @@ public class QueryTask extends ServiceDocument {
         }
     }
 
+    /**
+     * A list of authorization context links which can access this service.
+     */
+    public List<String> tenantLinks;
+
+    /**
+     * Task state
+     */
     public TaskState taskInfo = new TaskState();
 
     /**
@@ -746,6 +903,9 @@ public class QueryTask extends ServiceDocument {
      */
     public QuerySpecification querySpec;
 
+    /**
+     * Query results
+     */
     public ServiceDocumentQueryResult results;
 
     /**
@@ -755,7 +915,7 @@ public class QueryTask extends ServiceDocument {
     public String indexLink = ServiceUriPaths.CORE_DOCUMENT_INDEX;
 
     /**
-     * The node selector to use when {@link QueryOption.BROADCAST} is set
+     * The node selector to use when {@link QueryOption#BROADCAST} is set
      */
     public String nodeSelectorLink = ServiceUriPaths.DEFAULT_NODE_SELECTOR;
 
@@ -771,7 +931,7 @@ public class QueryTask extends ServiceDocument {
     }
 
     /**
-     * Rfc7519Builder class for constructing {@linkplain com.vmware.xenon.services.common.QueryTask query tasks}.
+     * Builder class for constructing {@linkplain com.vmware.xenon.services.common.QueryTask query tasks}.
      */
     public static class Builder {
         private final QueryTask queryTask;
@@ -807,6 +967,16 @@ public class QueryTask extends ServiceDocument {
          */
         public Builder setResultLimit(int resultLimit) {
             this.querySpec.resultLimit = resultLimit;
+            return this;
+        }
+
+        /**
+         * Set the maximum number of groups to return.
+         * @param resultLimit the result limit.
+         * @return a reference to this object.
+         */
+        public Builder setGroupResultLimit(int resultLimit) {
+            this.querySpec.groupResultLimit = resultLimit;
             return this;
         }
 
@@ -851,6 +1021,23 @@ public class QueryTask extends ServiceDocument {
         }
 
         /**
+         * Order group results in specified order by the given {@code fieldName}.
+         * This method implicitly calls {@link #setGroupByTerm(String, TypeName)}
+         * @param fieldName the field name to order results by.
+         * @param fieldType the field type.
+         * @return a reference to this object.
+         */
+        public Builder groupOrder(String fieldName, TypeName fieldType, SortOrder sortOrder) {
+            QueryTerm sortTerm = new QueryTerm();
+            setGroupByTerm(fieldName, fieldType);
+            sortTerm.propertyName = fieldName;
+            sortTerm.propertyType = fieldType;
+            this.querySpec.groupSortTerm = sortTerm;
+            this.querySpec.groupSortOrder = sortOrder;
+            return this;
+        }
+
+        /**
          * Add the given {@linkplain QueryOption query option}.
          * @param queryOption the query option to add.
          * @return a reference to this object.
@@ -867,6 +1054,38 @@ public class QueryTask extends ServiceDocument {
          */
         public Builder addOptions(EnumSet<QueryOption> queryOptions) {
             this.querySpec.options.addAll(queryOptions);
+            return this;
+        }
+
+        /**
+         * Add the given link field name to the {@code QuerySpecification#linkTerms}
+         */
+        public Builder addLinkTerm(String linkFieldName) {
+            QueryTerm linkTerm = new QueryTerm();
+            linkTerm.propertyName = linkFieldName;
+            linkTerm.propertyType = TypeName.STRING;
+            if (this.querySpec.linkTerms == null) {
+                this.querySpec.linkTerms = new ArrayList<>();
+            }
+            this.querySpec.linkTerms.add(linkTerm);
+            return this;
+        }
+
+        /**
+         * Sets the {@code QuerySpecification#groupByTerm}
+         */
+        public Builder setGroupByTerm(String fieldName) {
+            return setGroupByTerm(fieldName, TypeName.STRING);
+        }
+
+        /**
+         * Sets the {@code QuerySpecification#groupByTerm}
+         */
+        public Builder setGroupByTerm(String fieldName, TypeName fieldType) {
+            QueryTerm term = new QueryTerm();
+            term.propertyName = fieldName;
+            term.propertyType = fieldType;
+            this.querySpec.groupByTerm = term;
             return this;
         }
 

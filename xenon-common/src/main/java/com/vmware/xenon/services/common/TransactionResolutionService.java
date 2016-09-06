@@ -60,8 +60,15 @@ public class TransactionResolutionService extends StatelessService {
                     }
                     Operation operation = Operation
                             .createPatch(this.parent.getUri())
-                            .setBody(resolutionRequest);
-                    logInfo("Sending transaction resolution request to %s with kind %s", this.parent.getSelfLink(), resolutionRequest.kind);
+                            .setBody(resolutionRequest)
+                            .setCompletion((o2, e2) -> {
+                                if (e2 != null) {
+                                    op.fail(e2);
+                                    return;
+                                }
+                                logInfo("Transaction resolution request has been accepted by %s", this.parent.getSelfLink());
+                            });
+                    logInfo("Sending transaction resolution request to %s with kind %s", this.parent.getSelfLink(), resolutionRequest.resolutionKind);
                     sendRequest(operation);
                 }).setReferer(getUri());
 
@@ -69,19 +76,19 @@ public class TransactionResolutionService extends StatelessService {
         getHost().startSubscriptionService(subscribeToCoordinator, (notifyOp) -> {
             ResolutionRequest resolve = notifyOp.getBody(ResolutionRequest.class);
             notifyOp.complete();
-            logInfo("%s received notification: action=%s, resolution=%s", getSelfLink(), notifyOp.getAction(), resolve.kind);
-            if (isNotComplete(resolve.kind)) {
+            logInfo("Received notification: action=%s, resolution=%s", notifyOp.getAction(), resolve.resolutionKind);
+            if (isNotComplete(resolve.resolutionKind)) {
                 return;
             }
-            if ((resolve.kind == ResolutionKind.COMMITTED && resolutionRequest.kind == ResolutionKind.COMMIT) ||
-                    (resolve.kind == ResolutionKind.ABORTED && resolutionRequest.kind == ResolutionKind.ABORT)) {
+            if ((resolve.resolutionKind == ResolutionKind.COMMITTED && resolutionRequest.resolutionKind == ResolutionKind.COMMIT) ||
+                    (resolve.resolutionKind == ResolutionKind.ABORTED && resolutionRequest.resolutionKind == ResolutionKind.ABORT)) {
                 logInfo("Resolution of transaction %s is complete", this.parent.getSelfLink());
                 op.setBodyNoCloning(notifyOp.getBodyRaw());
                 op.setStatusCode(notifyOp.getStatusCode());
                 op.complete();
             } else {
-                String errorMsg = String.format("Resolution %s of transaction %s is different than requested", resolve.kind, this.parent.getSelfLink());
-                logInfo(errorMsg);
+                String errorMsg = String.format("Resolution %s of transaction %s is different than requested", resolve.resolutionKind, this.parent.getSelfLink());
+                logWarning(errorMsg);
                 op.fail(new IllegalStateException(errorMsg));
             }
         });

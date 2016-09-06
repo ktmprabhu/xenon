@@ -25,8 +25,7 @@ import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.core.SimpleAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.LongField;
+import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
@@ -37,7 +36,6 @@ import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.NumericRangeQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
@@ -116,12 +114,11 @@ public class LuceneBlobIndexService extends StatelessService {
 
     private Sort timeSort;
 
-    private final FieldType longStoredField = LuceneDocumentIndexService.numericDocType(
-            FieldType.NumericType.LONG, true);
-
     private final int maxBinaryContextSizeBytes = 1024 * 1024;
 
     private ExecutorService singleThreadedExecutor;
+
+    private byte[] buffer;
 
     public LuceneBlobIndexService() {
         this.indexDirectory = FILE_PATH;
@@ -180,11 +177,6 @@ public class LuceneBlobIndexService extends StatelessService {
     @Override
     public void handleRequest(Operation op) {
         Action a = op.getAction();
-        if (a == Action.PUT || a == Action.PATCH) {
-            getHost().failRequestActionNotSupported(op);
-            return;
-        }
-
         this.singleThreadedExecutor.execute(() -> {
             try {
                 switch (a) {
@@ -197,8 +189,8 @@ public class LuceneBlobIndexService extends StatelessService {
                 case POST:
                     handlePost(op);
                     break;
-                case PUT:
                 default:
+                    getHost().failRequestActionNotSupported(op);
                     break;
                 }
             } catch (Throwable e) {
@@ -282,7 +274,8 @@ public class LuceneBlobIndexService extends StatelessService {
                 post.fail(new IllegalArgumentException("service instance is required"));
                 return;
             }
-            byte[] binaryContent = new byte[this.maxBinaryContextSizeBytes];
+
+            byte[] binaryContent = getBuffer();
             int count = Utils.toBytes(content, binaryContent, 0);
             Document doc = new Document();
             Field binaryContentField = new StoredField(LUCENE_FIELD_NAME_BINARY_CONTENT,
@@ -293,9 +286,9 @@ public class LuceneBlobIndexService extends StatelessService {
                     Field.Store.NO);
             doc.add(keyField);
 
-            Field updateTimeField = new LongField(URI_PARAM_NAME_UPDATE_TIME,
-                    updateTime, this.longStoredField);
-            doc.add(updateTimeField);
+            LuceneDocumentIndexService.addNumericField(
+                    doc, URI_PARAM_NAME_UPDATE_TIME, updateTime, true);
+
             wr.addDocument(doc);
             this.indexUpdateTimeMicros = Utils.getNowMicrosUtc();
             post.setBody(null).complete();
@@ -303,6 +296,18 @@ public class LuceneBlobIndexService extends StatelessService {
             logSevere(e);
             post.fail(e);
         }
+    }
+
+    /**
+     * Allocates the buffer used to binary serialize blobs. It assumes a single threaded executor
+     * so it does not use locking
+     */
+    private byte[] getBuffer() {
+        if (this.buffer != null) {
+            return this.buffer;
+        }
+        this.buffer = new byte[this.maxBinaryContextSizeBytes];
+        return this.buffer;
     }
 
     @Override
@@ -327,6 +332,7 @@ public class LuceneBlobIndexService extends StatelessService {
             }
             wr.commit();
             wr.close();
+            this.buffer = null;
         } catch (Throwable e) {
 
         }
@@ -346,7 +352,7 @@ public class LuceneBlobIndexService extends StatelessService {
             return s;
         }
 
-        s = new IndexSearcher(DirectoryReader.open(w, true));
+        s = new IndexSearcher(DirectoryReader.open(w, true, true));
 
         if (this.searcherUpdateTimeMicros < now) {
             closeSearcherSafe();
@@ -367,10 +373,13 @@ public class LuceneBlobIndexService extends StatelessService {
             return;
         }
 
-        NumericRangeQuery<Long> timeQuery = NumericRangeQuery.newLongRange(
-                URI_PARAM_NAME_UPDATE_TIME, null, updateTime,
-                false,
-                true);
+        // Query all blobs that satisfy the passed linkQuery and have
+        // URI_PARAM_NAME_UPDATE_TIME field set to less than or
+        // equal to updateTime
+        Query timeQuery = LongPoint.newRangeQuery(
+                URI_PARAM_NAME_UPDATE_TIME,
+                Long.MIN_VALUE,
+                updateTime);
         BooleanQuery.Builder builder = new BooleanQuery.Builder()
                 .add(linkQuery, Occur.MUST)
                 .add(timeQuery, Occur.MUST);
@@ -403,6 +412,11 @@ public class LuceneBlobIndexService extends StatelessService {
                 closeSearcherSafe();
                 w.deleteUnusedFiles();
             }
+
+            // Periodically free the buffer. If we are busy serializing requests, they will be ahead of
+            // maintenance in the single threaded executor queue, so they will get to re-use the existing
+            // allocation
+            this.buffer = null;
             post.complete();
         } catch (Throwable e) {
             logSevere(e);

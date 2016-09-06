@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2015 VMware, Inc. All Rights Reserved.
+ * Copyright (c) 2014-2016 VMware, Inc. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy of
@@ -19,7 +19,6 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
@@ -30,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import com.vmware.xenon.common.RequestRouter.Route;
 import com.vmware.xenon.common.Service.Action;
@@ -68,8 +68,7 @@ public class ServiceDocumentDescription {
         InternetAddressV6,
         DATE,
         URI,
-        ENUM,
-        ARRAY,
+        ENUM
     }
 
     public enum PropertyUsageOption {
@@ -104,9 +103,25 @@ public class ServiceDocumentDescription {
         ID,
 
         /**
-         * Property is a Link (currently just used for DocumentDescription generation)
+         * Property is a link (relative URI path) to another indexed document
          */
         LINK,
+
+        /**
+         * Property is a collection of links (relative URI paths) to other indexed documents
+         */
+        LINKS,
+
+        /**
+         * Property contains sensitive information. Special framework methods should be used so the property value
+         * is hidden when serializing to JSON
+         */
+        SENSITIVE,
+
+        /**
+         * Property is required.
+         */
+        REQUIRED,
     }
 
     public enum PropertyIndexingOption {
@@ -119,6 +134,12 @@ public class ServiceDocumentDescription {
         EXPAND,
 
         /**
+         * Directs the indexing service to ensure the indexing property name will be a fixed
+         * value, matching that of the field itself. Applicable for MAP
+         */
+        FIXED_ITEM_NAME,
+
+        /**
          * Directs the indexing service to store but not index this field
          */
         STORE_ONLY,
@@ -129,6 +150,13 @@ public class ServiceDocumentDescription {
         TEXT,
 
         /**
+         * Directs the indexing service to index the field so queries converted to lower case,
+         * can find values originally in any case. The index will index the field content in lower
+         * case, but the original content will be preserved as part of the service document
+         */
+        CASE_INSENSITIVE,
+
+        /**
          * Directs the indexing service to exclude the field from the content signature calculation.
          */
         EXCLUDE_FROM_SIGNATURE,
@@ -136,11 +164,15 @@ public class ServiceDocumentDescription {
         /**
          * Directs the indexing service to add DocValues field to enable sorting.
          */
-        SORT,
+        SORT
     }
 
     public static class PropertyDescription {
         public ServiceDocumentDescription.TypeName typeName;
+        /**
+         * Set only for PODO-typed fields.
+         */
+        public String kind;
         public Object exampleValue;
         transient Field accessor;
 
@@ -157,6 +189,11 @@ public class ServiceDocumentDescription {
          * Description of element type if this property is of the ARRAY or COLLECTION type.
          */
         public PropertyDescription elementDescription;
+
+        /**
+         * Set only for enums, the set of possible values.
+         */
+        public String[] enumValues;
 
         public PropertyDescription() {
             this.indexingOptions = EnumSet.noneOf(PropertyIndexingOption.class);
@@ -223,6 +260,10 @@ public class ServiceDocumentDescription {
             return desc;
         }
 
+        public PropertyDescription buildPodoPropertyDescription(Class<?> type) {
+            return buildPodoPropertyDescription(type, new HashSet<>(), 0);
+        }
+
         public ServiceDocumentDescription buildDescription(
                 Class<? extends ServiceDocument> type,
                 EnumSet<Service.ServiceOption> serviceCaps) {
@@ -270,6 +311,9 @@ public class ServiceDocumentDescription {
                 if (ServiceDocument.isBuiltInInfrastructureDocumentField(f.getName())) {
                     fd.usageOptions.add(PropertyUsageOption.INFRASTRUCTURE);
                 }
+                if (ServiceDocument.isAutoMergeEnabledByDefaultForField(f.getName())) {
+                    fd.usageOptions.add(PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL);
+                }
                 if (ServiceDocument.isBuiltInSignatureExcludedDocumentField(f.getName())) {
                     fd.indexingOptions.add(PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE);
                 }
@@ -288,6 +332,10 @@ public class ServiceDocumentDescription {
 
                 fd.accessor = f;
                 pd.fieldDescriptions.put(f.getName(), fd);
+
+                if (fd.typeName == TypeName.PODO) {
+                    fd.kind = Utils.buildKind(f.getType());
+                }
             }
 
             visited.remove(typeName);
@@ -295,6 +343,7 @@ public class ServiceDocumentDescription {
             return pd;
         }
 
+        @SuppressWarnings("rawtypes")
         protected void buildPropertyDescription(
                 PropertyDescription pd,
                 Class<?> clazz,
@@ -328,17 +377,21 @@ public class ServiceDocumentDescription {
             } else if (Float.class.equals(clazz) || float.class.equals(clazz)) {
                 pd.typeName = TypeName.DOUBLE;
                 pd.exampleValue = 0.0F;
-            } else if (String.class.equals(clazz) || char.class.equals(clazz)) {
+            } else if (Number.class.equals(clazz)) {
+                // Special case for undefined Number fields.  Number subclasses will be PODOs.
+                pd.typeName = TypeName.DOUBLE;
+                pd.exampleValue = 0.0;
+            } else if (Character.class.equals(clazz) || char.class.equals(clazz)) {
+                pd.typeName = TypeName.STRING;
+                pd.exampleValue = 'a';
+            } else if (String.class.equals(clazz)) {
                 pd.typeName = TypeName.STRING;
                 pd.exampleValue = "example string";
             } else if (Date.class.equals(clazz)) {
                 pd.exampleValue = new Date();
                 pd.typeName = TypeName.DATE;
             } else if (URI.class.equals(clazz)) {
-                try {
-                    pd.exampleValue = new URI("http://localhost:1234/some/service");
-                } catch (URISyntaxException ignored) {
-                }
+                pd.exampleValue = URI.create("http://localhost:1234/some/service");
                 pd.typeName = TypeName.URI;
             } else {
                 isSimpleType = false;
@@ -422,8 +475,16 @@ public class ServiceDocumentDescription {
                     pd.elementDescription = fd;
                 } else if (Enum.class.isAssignableFrom(clazz)) {
                     pd.typeName = TypeName.ENUM;
+                    Object[] enumConstants = clazz.getEnumConstants();
+                    if (enumConstants != null) {
+                        pd.enumValues = Arrays
+                                .stream(enumConstants)
+                                .map(o -> ((Enum) o).name())
+                                .collect(Collectors.toList())
+                                .toArray(new String[0]);
+                    }
                 } else if (clazz.isArray()) {
-                    pd.typeName = TypeName.ARRAY;
+                    pd.typeName = TypeName.COLLECTION;
 
                     // Extract the component class from type
                     Type componentType = clazz.getComponentType();
@@ -461,6 +522,7 @@ public class ServiceDocumentDescription {
                     pd.elementDescription = fd;
                 } else {
                     pd.typeName = TypeName.PODO;
+                    pd.kind = Utils.buildKind(clazz);
                     if (depth > 0) {
                         // Force indexing of all nested complex PODO fields. If the service author
                         // instructed expand at the root level, we will index and expand everything

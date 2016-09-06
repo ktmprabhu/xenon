@@ -15,14 +15,12 @@ package com.vmware.xenon.performance;
 
 import java.util.logging.Level;
 
-import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ServiceHost;
-import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.RootNamespaceService;
 
 /**
- * Host a number of services targeting performance benchrmaks
+ * Host a number of services targeting performance benchmarks
  */
 public class PerfHost extends ServiceHost {
 
@@ -39,7 +37,6 @@ public class PerfHost extends ServiceHost {
 
     /**
      * Currently: Start a continuum of example services
-     * TODO -- test UI rendering
      */
     @Override
     public ServiceHost start() throws Throwable {
@@ -47,44 +44,14 @@ public class PerfHost extends ServiceHost {
 
         startDefaultCoreServicesSynchronously();
 
-        super.startService(
-                Operation.createPost(UriUtils.buildUri(this, RootNamespaceService.class)),
-                new RootNamespaceService()
-        );
-
-        super.startService(
-                Operation.createPost(UriUtils.buildUri(this,
-                        SimpleStatelessService.class)),
-                new SimpleStatelessService());
-
-        super.startService(
-                Operation.createPost(UriUtils.buildUri(this,
-                        SimpleStatefulService.SimpleStatefulFactoryService.class)),
-                new SimpleStatefulService.SimpleStatefulFactoryService(PerfUtils.SimpleState.class));
-
-        super.startService(
-                Operation.createPost(UriUtils.buildUri(this,
-                        PersistedService.PersistedFactoryService.class)),
-                new PersistedService.PersistedFactoryService(PerfUtils.SimpleState.class));
-
-        super.startService(
-                Operation.createPost(UriUtils.buildUri(this,
-                        ReplicatedService.ReplicatedFactoryService.class)),
-                new ReplicatedService.ReplicatedFactoryService(PerfUtils.SimpleState.class));
-
-        super.startService(
-                Operation.createPost(UriUtils.buildUri(this,
-                        OwnerSelectedService.OwnerSelectedFactoryService.class)),
-                new OwnerSelectedService.OwnerSelectedFactoryService(PerfUtils.SimpleState.class));
-
-        super.startService(
-                Operation.createPost(UriUtils.buildUri(this,
-                        FullCapService.FullCapFactoryService.class)),
-                FullCapService.FullCapFactoryService.create(PerfUtils.SimpleState.class));
-
-        super.startService(
-                Operation.createPost(UriUtils.buildFactoryUri(this, ExampleService.class)),
-                ExampleService.createFactory());
+        super.startService(new RootNamespaceService());
+        super.startService(new SimpleStatelessService());
+        super.startService(SimpleStatefulService.createFactory(PerfUtils.SimpleState.class));
+        super.startService(PersistedService.createFactory(PerfUtils.SimpleState.class));
+        super.startService(ReplicatedService.createFactory(PerfUtils.SimpleState.class));
+        super.startService(OwnerSelectedService.createFactory(PerfUtils.SimpleState.class));
+        super.startService(FullCapService.createFactory(PerfUtils.SimpleState.class));
+        super.startFactory(ExampleService.class, ExampleService::createFactory);
 
         return this;
     }

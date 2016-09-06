@@ -13,6 +13,7 @@
 
 package com.vmware.xenon.common;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
@@ -20,6 +21,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import org.junit.Before;
@@ -27,6 +29,9 @@ import org.junit.Test;
 
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.AggregationType;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.TimeBin;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
@@ -90,9 +95,9 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         List<Service> services = createServices(count);
         // verify no stats exist before we enable that capability
         for (Service s : services) {
-            ServiceStats stats = getStats(s.getUri());
+            Map<String, ServiceStat> stats = this.host.getServiceStats(s.getUri());
             assertTrue(stats != null);
-            assertTrue(stats.entries.isEmpty());
+            assertTrue(stats.isEmpty());
         }
 
         updateBody = ServiceConfigUpdateRequest.create();
@@ -136,10 +141,9 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         testWait(ctx);
 
         for (Service s : services) {
-            ServiceStats stats = getStats(s.getUri());
+            Map<String, ServiceStat> stats = this.host.getServiceStats(s.getUri());
             assertTrue(stats != null);
-            assertTrue(stats.entries != null);
-            assertTrue(!stats.entries.isEmpty());
+            assertTrue(!stats.isEmpty());
         }
     }
 
@@ -194,6 +198,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         ServiceStats.ServiceStat stat = new ServiceStat();
         stat.name = "key1";
         stat.latestValue = 100;
+        stat.unit = "unit";
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
         ServiceStats allStats = this.host.getServiceState(null, ServiceStats.class,
@@ -203,9 +208,15 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 100);
         assertTrue(retStatEntry.latestValue == 100);
         assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.unit.equals("unit"));
+        assertTrue(retStatEntry.sourceTimeMicrosUtc == null);
+
         // Step 3 - POST a stat with the same key again and verify that the
         // version and accumulated value are updated
         stat.latestValue = 50;
+        stat.unit = "unit1";
+        Long updatedMicrosUtc1 = Utils.getNowMicrosUtc();
+        stat.sourceTimeMicrosUtc = updatedMicrosUtc1;
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
         allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
@@ -214,10 +225,16 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 150);
         assertTrue(retStatEntry.latestValue == 50);
         assertTrue(retStatEntry.version == 2);
+        assertTrue(retStatEntry.unit.equals("unit1"));
+        assertTrue(retStatEntry.sourceTimeMicrosUtc == updatedMicrosUtc1);
+
         // Step 4 - POST a stat with a new key and verify that the
         // previously posted stat is not updated
         stat.name = "key2";
         stat.latestValue = 50;
+        stat.unit = "unit2";
+        Long updatedMicrosUtc2 = Utils.getNowMicrosUtc();
+        stat.sourceTimeMicrosUtc = updatedMicrosUtc2;
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
         allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
@@ -226,14 +243,21 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 150);
         assertTrue(retStatEntry.latestValue == 50);
         assertTrue(retStatEntry.version == 2);
+        assertTrue(retStatEntry.unit.equals("unit1"));
+        assertTrue(retStatEntry.sourceTimeMicrosUtc == updatedMicrosUtc1);
+
         retStatEntry = allStats.entries.get("key2");
         assertTrue(retStatEntry.accumulatedValue == 50);
         assertTrue(retStatEntry.latestValue == 50);
         assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.unit.equals("unit2"));
+        assertTrue(retStatEntry.sourceTimeMicrosUtc == updatedMicrosUtc2);
 
         // Step 5 - Issue a PUT for the first stat key and verify that the doc state is replaced
         stat.name = "key1";
         stat.latestValue = 75;
+        stat.unit = "replaceUnit";
+        stat.sourceTimeMicrosUtc = null;
         this.host.sendAndWaitExpectSuccess(Operation.createPut(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
         allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
@@ -242,10 +266,14 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 75);
         assertTrue(retStatEntry.latestValue == 75);
         assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.unit.equals("replaceUnit"));
+        assertTrue(retStatEntry.sourceTimeMicrosUtc == null);
+
         // Step 6 - Issue a bulk PUT and verify that the complete set of stats is updated
         ServiceStats stats = new ServiceStats();
         stat.name = "key3";
         stat.latestValue = 200;
+        stat.unit = "unit3";
         stats.entries.put("key3", stat);
         this.host.sendAndWaitExpectSuccess(Operation.createPut(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stats));
@@ -265,6 +293,8 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 200);
         assertTrue(retStatEntry.latestValue == 200);
         assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.unit.equals("unit3"));
+
         // Step 7 - Issue a PATCH and verify that the latestValue is updated
         stat.latestValue = 25;
         this.host.sendAndWaitExpectSuccess(Operation.createPatch(UriUtils.buildStatsUri(
@@ -274,6 +304,150 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         retStatEntry = allStats.entries.get("key3");
         assertTrue(retStatEntry.latestValue == 225);
         assertTrue(retStatEntry.version == 2);
+    }
+
+    @Test
+    public void testTimeSeriesStats() throws Throwable {
+        long startTime = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
+        int numBins = 4;
+        long interval = 1000;
+        double value = 100;
+        // set data to fill up the specified number of bins
+        TimeSeriesStats timeSeriesStats = new TimeSeriesStats(numBins, interval, EnumSet.allOf(AggregationType.class));
+        for (int i = 0; i < numBins; i++) {
+            startTime += TimeUnit.MILLISECONDS.toMicros(interval);
+            value += 1;
+            timeSeriesStats.add(startTime, value);
+        }
+        assertTrue(timeSeriesStats.bins.size() == numBins);
+        // insert additional unique datapoints; the earliest entries should be dropped
+        for (int i = 0; i < numBins / 2; i++) {
+            startTime += TimeUnit.MILLISECONDS.toMicros(interval);
+            value += 1;
+            timeSeriesStats.add(startTime, value);
+        }
+        assertTrue(timeSeriesStats.bins.size() == numBins);
+        long timeMicros = startTime - TimeUnit.MILLISECONDS.toMicros(interval * (numBins - 1));
+        long timeMillis = TimeUnit.MICROSECONDS.toMillis(timeMicros);
+        timeMillis -= (timeMillis % interval);
+        assertTrue(timeSeriesStats.bins.firstKey() == timeMillis);
+
+        // insert additional datapoints for an existing bin. The count should increase,
+        // min, max, average computed appropriately
+        double origValue = value;
+        double accumulatedValue = value;
+        double newValue = value;
+        double count = 1;
+        for (int i = 0; i < numBins / 2; i++) {
+            newValue++;
+            count++;
+            timeSeriesStats.add(startTime, newValue);
+            accumulatedValue += newValue;
+        }
+        TimeBin lastBin = timeSeriesStats.bins.get(timeSeriesStats.bins.lastKey());
+        assertTrue(lastBin.avg.equals(accumulatedValue / count));
+        assertTrue(lastBin.sum.equals(accumulatedValue));
+        assertTrue(lastBin.count == count);
+        assertTrue(lastBin.max.equals(newValue));
+        assertTrue(lastBin.min.equals(origValue));
+
+        // test with a subset of the aggregation types specified
+        timeSeriesStats = new TimeSeriesStats(numBins, interval, EnumSet.of(AggregationType.AVG));
+        timeSeriesStats.add(startTime, value);
+        lastBin = timeSeriesStats.bins.get(timeSeriesStats.bins.lastKey());
+        assertTrue(lastBin.avg != null);
+        assertTrue(lastBin.count != 0);
+        assertTrue(lastBin.max == null);
+        assertTrue(lastBin.min == null);
+
+        timeSeriesStats = new TimeSeriesStats(numBins, interval, EnumSet.of(AggregationType.MIN, AggregationType.MAX));
+        timeSeriesStats.add(startTime, value);
+        lastBin = timeSeriesStats.bins.get(timeSeriesStats.bins.lastKey());
+        assertTrue(lastBin.avg == null);
+        assertTrue(lastBin.count == 0);
+        assertTrue(lastBin.max != null);
+        assertTrue(lastBin.min != null);
+
+        // Step 2 - POST a stat to the service instance and verify we can fetch the stat just posted
+        String name = UUID.randomUUID().toString();
+        ExampleServiceState s = new ExampleServiceState();
+        s.name = name;
+        Consumer<Operation> bodySetter = (o) -> {
+            o.setBody(s);
+        };
+        URI factoryURI = UriUtils.buildFactoryUri(this.host, ExampleService.class);
+        Map<URI, ExampleServiceState> states = this.host.doFactoryChildServiceStart(null, 1,
+                ExampleServiceState.class, bodySetter, factoryURI);
+        ExampleServiceState exampleServiceState = states.values().iterator().next();
+        ServiceStats.ServiceStat stat = new ServiceStat();
+        stat.name = "key1";
+        stat.latestValue = 100;
+        // set bin size to 1ms
+        stat.timeSeriesStats = new TimeSeriesStats(numBins, 1, EnumSet.allOf(AggregationType.class));
+        this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
+                this.host, exampleServiceState.documentSelfLink)).setBody(stat));
+        for (int i = 0; i < numBins; i++) {
+            Thread.sleep(1);
+            this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
+                    this.host, exampleServiceState.documentSelfLink)).setBody(stat));
+        }
+        ServiceStats allStats = this.host.getServiceState(null, ServiceStats.class,
+                UriUtils.buildStatsUri(
+                        this.host, exampleServiceState.documentSelfLink));
+        ServiceStat retStatEntry = allStats.entries.get(stat.name);
+        assertTrue(retStatEntry.accumulatedValue == 100 * (numBins + 1));
+        assertTrue(retStatEntry.latestValue == 100);
+        assertTrue(retStatEntry.version == numBins + 1);
+        assertTrue(retStatEntry.timeSeriesStats.bins.size() == numBins);
+
+        // Step 3 - POST a stat to the service instance with sourceTimeMicrosUtc and verify we can fetch the stat just posted
+        String statName = UUID.randomUUID().toString();
+        ExampleServiceState exampleState = new ExampleServiceState();
+        exampleState.name = statName;
+        Consumer<Operation> setter = (o) -> {
+            o.setBody(exampleState);
+        };
+        Map<URI, ExampleServiceState> stateMap = this.host.doFactoryChildServiceStart(null, 1,
+                ExampleServiceState.class, setter,
+                UriUtils.buildFactoryUri(this.host, ExampleService.class));
+        ExampleServiceState returnExampleState = stateMap.values().iterator().next();
+        ServiceStats.ServiceStat sourceStat1 = new ServiceStat();
+        sourceStat1.name = "sourceKey1";
+        sourceStat1.latestValue = 100;
+        // Timestamp 946713600000000 equals Jan 1, 2000
+        Long sourceTimeMicrosUtc1 = 946713600000000L;
+        sourceStat1.sourceTimeMicrosUtc = sourceTimeMicrosUtc1;
+        ServiceStats.ServiceStat sourceStat2 = new ServiceStat();
+        sourceStat2.name = "sourceKey2";
+        sourceStat2.latestValue = 100;
+        // Timestamp 946713600000000 equals Jan 2, 2000
+        Long sourceTimeMicrosUtc2 = 946800000000000L;
+        sourceStat2.sourceTimeMicrosUtc = sourceTimeMicrosUtc2;
+        // set bucket size to 1ms
+        sourceStat1.timeSeriesStats = new TimeSeriesStats(numBins, 1, EnumSet.allOf(AggregationType.class));
+        sourceStat2.timeSeriesStats = new TimeSeriesStats(numBins, 1, EnumSet.allOf(AggregationType.class));
+        this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
+                this.host, returnExampleState.documentSelfLink)).setBody(sourceStat1));
+        this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
+                this.host, returnExampleState.documentSelfLink)).setBody(sourceStat2));
+        allStats = this.host.getServiceState(null, ServiceStats.class,
+                UriUtils.buildStatsUri(
+                        this.host, returnExampleState.documentSelfLink));
+        retStatEntry = allStats.entries.get(sourceStat1.name);
+        assertTrue(retStatEntry.accumulatedValue == 100);
+        assertTrue(retStatEntry.latestValue == 100);
+        assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.timeSeriesStats.bins.size() == 1);
+        assertTrue(retStatEntry.timeSeriesStats.bins.firstKey()
+                .equals(TimeUnit.MICROSECONDS.toMillis(sourceTimeMicrosUtc1)));
+
+        retStatEntry = allStats.entries.get(sourceStat2.name);
+        assertTrue(retStatEntry.accumulatedValue == 100);
+        assertTrue(retStatEntry.latestValue == 100);
+        assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.timeSeriesStats.bins.size() == 1);
+        assertTrue(retStatEntry.timeSeriesStats.bins.firstKey()
+                .equals(TimeUnit.MICROSECONDS.toMillis(sourceTimeMicrosUtc2)));
     }
 
     public static class SetAvailableValidationService extends StatefulService {
@@ -301,6 +475,18 @@ public class TestUtilityService extends BasicReusableHostTestCase {
     }
 
     @Test
+    public void failureOnReservedSuffixServiceStart() throws Throwable {
+        TestContext ctx = this.testCreate(ServiceHost.RESERVED_SERVICE_URI_PATHS.length);
+        for (String reservedSuffix : ServiceHost.RESERVED_SERVICE_URI_PATHS) {
+            Operation post = Operation.createPost(this.host,
+                    UUID.randomUUID().toString() + "/" + reservedSuffix)
+                    .setCompletion(ctx.getExpectedFailureCompletion());
+            this.host.startService(post, new MinimalTestService());
+        }
+        this.testWait(ctx);
+    }
+
+    @Test
     public void testIsAvailableStatAndSuffix() throws Throwable {
         long c = 1;
         URI factoryURI = UriUtils.buildFactoryUri(this.host, ExampleService.class);
@@ -315,15 +501,12 @@ public class TestUtilityService extends BasicReusableHostTestCase {
 
         // first verify that service that do not explicitly use the setAvailable method,
         // appear available. Both a factory and a child service
-        Operation get = Operation.createGet(UriUtils.buildAvailableUri(factoryURI));
-
-        // expect 200 from /factory/available
-        this.host.sendAndWaitExpectSuccess(get);
+        this.host.waitForServiceAvailable(factoryURI);
 
         // expect 200 from /factory/<child>/available
         TestContext ctx = testCreate(states.size());
         for (URI u : states.keySet()) {
-            get = get.clone().setUri(UriUtils.buildAvailableUri(u))
+            Operation get = Operation.createGet(UriUtils.buildAvailableUri(u))
                     .setCompletion(ctx.getCompletion());
             this.host.send(get);
         }
@@ -340,7 +523,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         this.host.sendAndWaitExpectSuccess(put);
 
         // verify factory now appears unavailable
-        get = Operation.createGet(UriUtils.buildAvailableUri(factoryURI));
+        Operation get = Operation.createGet(UriUtils.buildAvailableUri(factoryURI));
         this.host.sendAndWaitExpectFailure(get);
 
         // verify PUT on child services makes them unavailable
@@ -387,9 +570,20 @@ public class TestUtilityService extends BasicReusableHostTestCase {
                 "/core/ui/default/#"));
     }
 
-    public ServiceStats getStats(URI uri) throws Throwable {
-        URI statsURI = UriUtils.buildStatsUri(uri);
-        ServiceStats stats = this.host.getServiceState(null, ServiceStats.class, statsURI);
-        return stats;
+    public static void validateTimeSeriesStat(ServiceStat stat, long expectedBinDurationMillis) {
+        assertTrue(stat != null);
+        assertTrue(stat.timeSeriesStats != null);
+        assertTrue(stat.version > 1);
+        assertEquals(expectedBinDurationMillis, stat.timeSeriesStats.binDurationMillis);
+        double maxAvg = 0;
+        double countPerMaxAvgBin = 0;
+        for (TimeBin bin : stat.timeSeriesStats.bins.values()) {
+            if (bin.avg != null && bin.avg > maxAvg) {
+                maxAvg = bin.avg;
+                countPerMaxAvgBin = bin.count;
+            }
+        }
+        assertTrue(maxAvg > 0);
+        assertTrue(countPerMaxAvgBin >= 1);
     }
 }

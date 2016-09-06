@@ -4,6 +4,7 @@
 *.swp
 .settings/*
 /bin
+*/bin
 target
 .classpath
 .project
@@ -18,3 +19,13 @@ tmp/
 # maven-release-plugin artifacts
 /release.properties
 pom.xml.releaseBackup
+
+# go artifacts
+xenon-client/bin
+xenon-client/src/main/resources/*
+xenon-client/src/main/go/_vendor/src/*
+xenon-common/src/main/go/_vendor/src/*
+
+# vagrant
+vagrant/
+.vagrant/

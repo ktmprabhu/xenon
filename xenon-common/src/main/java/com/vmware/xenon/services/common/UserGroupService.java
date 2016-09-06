@@ -13,13 +13,40 @@
 
 package com.vmware.xenon.services.common;
 
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.services.common.QueryTask.Query;
 
 public class UserGroupService extends StatefulService {
+
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_USER_GROUPS;
+
+    public static Service createFactory() {
+        FactoryService fs = new FactoryService(UserGroupState.class) {
+
+            @Override
+            public Service createServiceInstance() throws Throwable {
+                return new UserGroupService();
+            }
+
+            @Override
+            public void handlePost(Operation request) {
+                UserGroupState userGroupState =
+                        AuthorizationCacheUtils.extractBody(request, this, UserGroupState.class);
+                if (userGroupState != null) {
+                    AuthorizationCacheUtils.clearAuthzCacheForUserGroup(this, request, userGroupState);
+                }
+                super.handlePost(request);
+            }
+        };
+        fs.toggleOption(ServiceOption.IDEMPOTENT_POST, true);
+        return fs;
+    }
+
     /**
      * The {@link UserGroupState} holds the query that is used to represent a group of users.
      */
@@ -35,6 +62,16 @@ public class UserGroupService extends StatefulService {
     }
 
     @Override
+    public void handleRequest(Operation request, OperationProcessingStage opProcessingStage) {
+        UserGroupState userGroupState =
+                AuthorizationCacheUtils.extractBody(request, this, UserGroupState.class);
+        if (userGroupState != null) {
+            AuthorizationCacheUtils.clearAuthzCacheForUserGroup(this, request, userGroupState);
+        }
+        super.handleRequest(request, opProcessingStage);
+    }
+
+    @Override
     public void handleStart(Operation op) {
         if (!op.hasBody()) {
             op.fail(new IllegalArgumentException("body is required"));
@@ -45,7 +82,6 @@ public class UserGroupService extends StatefulService {
         if (!validate(op, newState)) {
             return;
         }
-
         op.complete();
     }
 
@@ -62,13 +98,12 @@ public class UserGroupService extends StatefulService {
         }
 
         UserGroupState currentState = getState(op);
-        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
             op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
         } else {
             setState(op, newState);
         }
-
         op.complete();
     }
 

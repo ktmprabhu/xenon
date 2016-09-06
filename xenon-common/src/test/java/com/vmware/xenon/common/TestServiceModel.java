@@ -17,6 +17,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import static com.vmware.xenon.common.Service.STAT_NAME_OPERATION_DURATION;
+
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Date;
@@ -24,11 +26,13 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import org.junit.Test;
 
 import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.Operation.OperationOption;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.Service.ProcessingStage;
 import com.vmware.xenon.common.Service.ServiceOption;
@@ -131,15 +135,17 @@ public class TestServiceModel extends BasicReusableHostTestCase {
         // first issue a delete with a body (used as a hint to fail delete), and it should be aborted.
         // Verify service is still running if it fails delete
         Operation delete = Operation.createDelete(serviceToBeDeleted.getUri())
-                .setBody(body)
-                .setCompletion(this.host.getExpectedFailureCompletion());
-        this.host.sendAndWait(delete);
+                .setBody(body);
+        Operation response = this.host.waitForResponse(delete);
+        assertNotNull(response);
+        assertEquals(Operation.STATUS_CODE_INTERNAL_ERROR, response.getStatusCode());
 
         // try a delete that should be aborted with the factory service
         delete = Operation.createDelete(factoryService.getUri())
-                .setBody(body)
-                .setCompletion(this.host.getExpectedFailureCompletion());
-        this.host.sendAndWait(delete);
+                .setBody(body);
+        response = this.host.waitForResponse(delete);
+        assertNotNull(response);
+        assertEquals(Operation.STATUS_CODE_INTERNAL_ERROR, response.getStatusCode());
 
         // verify services are still running
         assertEquals(ProcessingStage.AVAILABLE,
@@ -147,9 +153,11 @@ public class TestServiceModel extends BasicReusableHostTestCase {
         assertEquals(ProcessingStage.AVAILABLE,
                 this.host.getServiceStage(serviceToBeDeleted.getSelfLink()));
 
-        delete = Operation.createDelete(serviceToBeDeleted.getUri())
-                .setCompletion(this.host.getCompletion());
-        this.host.sendAndWait(delete);
+        delete = Operation.createDelete(serviceToBeDeleted.getUri());
+        response = this.host.waitForResponse(delete);
+        assertNotNull(response);
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
+
         assertTrue(serviceToBeDeleted.gotDeleted);
         assertTrue(serviceToBeDeleted.gotStopped);
 
@@ -443,8 +451,7 @@ public class TestServiceModel extends BasicReusableHostTestCase {
                 throw new RuntimeException("Unsupported action");
             }
 
-            op
-                    .forceRemote()
+            op.forceRemote()
                     .setBody(new ContextIdTestService.State())
                     .setContextId(contextId)
                     .setCompletion((o, e) -> {
@@ -456,11 +463,8 @@ public class TestServiceModel extends BasicReusableHostTestCase {
                         this.host.completeIteration();
                     });
 
-            if (useCallback) {
-                this.host.sendRequestWithCallback(op.setReferer(this.host.getReferer()));
-            } else {
-                this.host.send(op);
-            }
+            op.toggleOption(OperationOption.SEND_WITH_CALLBACK, useCallback);
+            this.host.send(op);
         }
         // reset context id, since its set in the main thread
         OperationContext.setContextId(null);
@@ -752,7 +756,9 @@ public class TestServiceModel extends BasicReusableHostTestCase {
 
     public static class PeriodicMaintenanceTestStatelessService extends StatelessService {
         public PeriodicMaintenanceTestStatelessService() {
-            this.setMaintenanceIntervalMicros(1);
+            this.setMaintenanceIntervalMicros(
+                    TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS * 3)
+            );
             this.toggleOption(ServiceOption.INSTRUMENTATION, true);
             this.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
         }
@@ -766,7 +772,9 @@ public class TestServiceModel extends BasicReusableHostTestCase {
     public static class PeriodicMaintenanceTestStatefulService extends StatefulService {
         public PeriodicMaintenanceTestStatefulService() {
             super(ServiceDocument.class);
-            this.setMaintenanceIntervalMicros(1);
+            this.setMaintenanceIntervalMicros(
+                    TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS * 3)
+            );
             this.toggleOption(ServiceOption.INSTRUMENTATION, true);
             this.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
         }
@@ -818,6 +826,34 @@ public class TestServiceModel extends BasicReusableHostTestCase {
                 throw new TimeoutException();
             }
         }
+    }
+
+    @Test
+    public void getStatelessServiceOperationStats() throws Throwable {
+        MinimalFactoryTestService factoryService = new MinimalFactoryTestService();
+        MinimalTestServiceState body = new MinimalTestServiceState();
+        body.id = UUID.randomUUID().toString();
+        this.host.startServiceAndWait(factoryService, UUID.randomUUID().toString(), body);
+        // try a post on the factory service and assert that the stats are collected for the post operation.
+        Operation post = Operation.createPost(factoryService.getUri())
+                .setBody(body);
+        Operation response = this.host.waitForResponse(post);
+        assertNotNull(response);
+        this.host.waitFor("stats not found", () -> {
+            ServiceStats testStats = host.getServiceState(null, ServiceStats.class, UriUtils
+                    .buildStatsUri(factoryService.getUri()));
+            if (testStats == null) {
+                return false;
+            }
+
+            ServiceStat serviceStat = testStats.entries
+                    .get(Action.POST + STAT_NAME_OPERATION_DURATION);
+            if (serviceStat == null || serviceStat.latestValue == 0) {
+                return false;
+            }
+            host.log(Utils.toJsonHtml(testStats));
+            return true;
+        });
     }
 
 }

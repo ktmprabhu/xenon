@@ -22,6 +22,7 @@ import com.vmware.xenon.common.FileUtils;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState;
+import com.vmware.xenon.common.ServiceStats;
 import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
@@ -32,6 +33,35 @@ import com.vmware.xenon.common.Utils;
  */
 public class ServiceHostManagementService extends StatefulService {
     public static final String SELF_LINK = UriUtils.buildUriPath(ServiceUriPaths.CORE_MANAGEMENT);
+
+    public static final String STAT_NAME_AVAILABLE_MEMORY_BYTES_PREFIX = "availableMemoryBytes";
+    public static final String STAT_NAME_AVAILABLE_MEMORY_BYTES_PER_DAY = STAT_NAME_AVAILABLE_MEMORY_BYTES_PREFIX
+            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY;
+    public static final String STAT_NAME_AVAILABLE_MEMORY_BYTES_PER_HOUR = STAT_NAME_AVAILABLE_MEMORY_BYTES_PREFIX
+            + ServiceStats.STAT_NAME_SUFFIX_PER_HOUR;
+    public static final String STAT_NAME_AVAILABLE_DISK_BYTES_PREFIX = "availableDiskByte";
+    public static final String STAT_NAME_AVAILABLE_DISK_BYTES_PER_DAY = STAT_NAME_AVAILABLE_DISK_BYTES_PREFIX
+            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY;
+    public static final String STAT_NAME_AVAILABLE_DISK_BYTES_PER_HOUR = STAT_NAME_AVAILABLE_DISK_BYTES_PREFIX
+            + ServiceStats.STAT_NAME_SUFFIX_PER_HOUR;
+    public static final String STAT_NAME_CPU_USAGE_PCT_PREFIX = "cpuUsagePercent";
+    public static final String STAT_NAME_CPU_USAGE_PCT_PER_DAY = STAT_NAME_CPU_USAGE_PCT_PREFIX
+            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY;
+    public static final String STAT_NAME_CPU_USAGE_PCT_PER_HOUR = STAT_NAME_CPU_USAGE_PCT_PREFIX
+            + ServiceStats.STAT_NAME_SUFFIX_PER_HOUR;
+
+    public static final String STAT_NAME_THREAD_COUNT_PREFIX = "threadCount";
+    public static final String STAT_NAME_THREAD_COUNT_PER_DAY = STAT_NAME_THREAD_COUNT_PREFIX
+            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY;
+    public static final String STAT_NAME_THREAD_COUNT_PER_HOUR = STAT_NAME_THREAD_COUNT_PREFIX
+            + ServiceStats.STAT_NAME_SUFFIX_PER_HOUR;
+
+    public static final String STAT_NAME_SERVICE_PAUSE_COUNT = "servicePauseCount";
+    public static final String STAT_NAME_SERVICE_RESUME_COUNT = "serviceResumeCount";
+    public static final String STAT_NAME_SERVICE_CACHE_CLEAR_COUNT = "serviceCacheClearCount";
+    public static final String STAT_NAME_ODL_CACHE_CLEAR_COUNT = "onDemandLoadCacheClearCount";
+    public static final String STAT_NAME_ODL_STOP_COUNT = "onDemandLoadStopCount";
+    public static final String STAT_NAME_ODL_STOP_CONFLICT_COUNT = "onDemandLoadStopConflictCount";
 
     public ServiceHostManagementService() {
         super(ServiceHostState.class);
@@ -262,7 +292,7 @@ public class ServiceHostManagementService extends StatefulService {
         File f = new File(file);
 
         Operation post = Operation.createPost(req.destination)
-                .setReferer(op.getReferer()).setCompletion((o, e) -> {
+                .transferRefererFrom(op).setCompletion((o, e) -> {
                     if (e != null) {
                         op.fail(e);
                         return;
@@ -318,7 +348,7 @@ public class ServiceHostManagementService extends StatefulService {
             };
 
             Operation downloadFileOp = Operation.createGet(req.destination)
-                    .setReferer(op.getReferer()).setCompletion(c);
+                    .transferRefererFrom(op).setCompletion(c);
             FileUtils.getFile(this.getHost().getClient(), downloadFileOp, fileToDownload);
 
         } catch (IOException e) {

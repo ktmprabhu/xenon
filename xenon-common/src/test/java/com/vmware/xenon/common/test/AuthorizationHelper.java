@@ -13,6 +13,10 @@
 
 package com.vmware.xenon.common.test;
 
+import static org.junit.Assert.assertTrue;
+
+import static com.vmware.xenon.services.common.authn.BasicAuthenticationUtils.constructBasicAuth;
+
 import java.net.URI;
 import java.util.Arrays;
 import java.util.Collection;
@@ -22,6 +26,7 @@ import java.util.Set;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Service.Action;
+import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
@@ -29,19 +34,25 @@ import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.QueryTask;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.Query.Builder;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification;
 import com.vmware.xenon.services.common.ResourceGroupService.ResourceGroupState;
 import com.vmware.xenon.services.common.RoleService.Policy;
 import com.vmware.xenon.services.common.RoleService.RoleState;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.UserGroupService;
 import com.vmware.xenon.services.common.UserGroupService.UserGroupState;
 import com.vmware.xenon.services.common.UserService.UserState;
+import com.vmware.xenon.services.common.authn.AuthenticationRequest;
+import com.vmware.xenon.services.common.authn.BasicAuthenticationService;
 
+/**
+ * Consider using {@link com.vmware.xenon.common.AuthorizationSetupHelper}
+ */
 public class AuthorizationHelper {
-    public static final String USER_EMAIL = "jane@doe.com";
-    public static final String USER_SERVICE_PATH =
-            UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USERS, USER_EMAIL);
 
     private String userGroupLink;
+    private String resourceGroupLink;
+    private String roleLink;
 
     VerificationHost host;
 
@@ -74,43 +85,179 @@ public class AuthorizationHelper {
         return userUriPath[0];
     }
 
+    public void patchUserService(ServiceHost target, String userServiceLink, UserState userState) throws Throwable {
+        URI patchUserUri = UriUtils.buildUri(target, userServiceLink);
+        this.host.testStart(1);
+        this.host.send(Operation
+                .createPatch(patchUserUri)
+                .setBody(userState)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        this.host.failIteration(e);
+                        return;
+                    }
+                    this.host.completeIteration();
+                }));
+        this.host.testWait();
+    }
+
+    /**
+     * Find user document and return the path.
+     *   ex: /core/authz/users/sample@vmware.com
+     *
+     * @see VerificationHost#assumeIdentity(String)
+     */
+    public String findUserServiceLink(String userEmail) throws Throwable {
+        Query userQuery = Query.Builder.create()
+                .addFieldClause(ServiceDocument.FIELD_NAME_KIND, Utils.buildKind(UserState.class))
+                .addFieldClause(UserState.FIELD_NAME_EMAIL, userEmail)
+                .build();
+
+        QueryTask queryTask = QueryTask.Builder.createDirectTask()
+                .setQuery(userQuery)
+                .build();
+
+        URI queryTaskUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_QUERY_TASKS);
+
+        String[] userServiceLink = new String[1];
+
+        TestContext ctx = this.host.testCreate(1);
+        Operation postQuery = Operation.createPost(queryTaskUri)
+                .setBody(queryTask)
+                .setCompletion((op, ex) -> {
+                    if (ex != null) {
+                        ctx.failIteration(ex);
+                        return;
+                    }
+                    QueryTask queryResponse = op.getBody(QueryTask.class);
+                    int resultSize = queryResponse.results.documentLinks.size();
+                    if (queryResponse.results.documentLinks.size() != 1) {
+                        String msg = String
+                                .format("Could not find user %s, found=%d", userEmail, resultSize);
+                        ctx.failIteration(new IllegalStateException(msg));
+                        return;
+                    } else {
+                        userServiceLink[0] = queryResponse.results.documentLinks.get(0);
+                    }
+                    ctx.completeIteration();
+                });
+        this.host.send(postQuery);
+        this.host.testWait(ctx);
+
+        return userServiceLink[0];
+    }
+
+    /**
+     * Call BasicAuthenticationService and returns auth token.
+     */
+    public String login(String email, String password) throws Throwable {
+        String basicAuth = constructBasicAuth(email, password);
+        URI loginUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHN_BASIC);
+        AuthenticationRequest login = new AuthenticationRequest();
+        login.requestType = AuthenticationRequest.AuthenticationRequestType.LOGIN;
+
+        String[] authToken = new String[1];
+
+        TestContext ctx = this.host.testCreate(1);
+
+        Operation loginPost = Operation.createPost(loginUri)
+                .setBody(login)
+                .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME,
+                        basicAuth)
+                .forceRemote()
+                .setCompletion((op, ex) -> {
+                    if (ex != null) {
+                        ctx.failIteration(ex);
+                        return;
+                    }
+                    authToken[0] = op.getResponseHeader(Operation.REQUEST_AUTH_TOKEN_HEADER);
+                    if (authToken[0] == null) {
+                        ctx.failIteration(
+                                new IllegalStateException("Missing auth token in login response"));
+                        return;
+                    }
+                    ctx.completeIteration();
+                });
+
+        this.host.send(loginPost);
+        this.host.testWait(ctx);
+
+        assertTrue(authToken[0] != null);
+
+        return authToken[0];
+
+    }
+
     public void setUserGroupLink(String userGroupLink) {
         this.userGroupLink = userGroupLink;
+    }
+
+    public void setResourceGroupLink(String resourceGroupLink) {
+        this.resourceGroupLink = resourceGroupLink;
+    }
+
+    public void setRoleLink(String roleLink) {
+        this.roleLink = roleLink;
     }
 
     public String getUserGroupLink() {
         return this.userGroupLink;
     }
 
+    public String getResourceGroupLink() {
+        return this.resourceGroupLink;
+    }
+
+    public String getRoleLink() {
+        return this.roleLink;
+    }
+
     public String createUserService(ServiceHost target, String email) throws Throwable {
         return createUserService(this.host, target, email);
     }
 
-    public Collection<String> createRoles(ServiceHost target) throws Throwable {
-        final Integer concurrentTasks = 6;
-        this.host.testStart(concurrentTasks);
+    public Collection<String> createRoles(ServiceHost target, String email) throws Throwable {
+        return createRoles(target, email, true);
+    }
 
-        // Create user group for jane@doe.com
-        String userGroupLink =
-                createUserGroup(target, "janes-user-group", Builder.create()
+    public String getUserGroupName(String email) {
+        String emailPrefix = email.substring(0, email.indexOf("@"));
+        return emailPrefix + "-user-group";
+    }
+
+    public Collection<String> createRoles(ServiceHost target, String email, boolean createUserGroupByEmail) throws Throwable {
+        String emailPrefix = email.substring(0, email.indexOf("@"));
+        String userGroupLink = null;
+        // Create user group
+        if (createUserGroupByEmail) {
+            userGroupLink =  createUserGroup(target, getUserGroupName(email), Builder.create()
                         .addFieldClause(
                                 "email",
-                                USER_EMAIL)
+                                email)
                         .build());
 
+        } else {
+            String groupName = getUserGroupName(email);
+            userGroupLink =  createUserGroup(target, groupName, Builder.create()
+                    .addFieldClause(
+                            QuerySpecification
+                            .buildCollectionItemName(UserState.FIELD_NAME_USER_GROUP_LINKS),
+                            UriUtils.buildUriPath(UserGroupService.FACTORY_LINK, groupName))
+                    .build());
+        }
         setUserGroupLink(userGroupLink);
 
         // Create resource group for example service state
         String exampleServiceResourceGroupLink =
-                createResourceGroup(target, "janes-resource-group", Builder.create()
+                createResourceGroup(target, emailPrefix + "-resource-group", Builder.create()
                         .addFieldClause(
                                 ExampleServiceState.FIELD_NAME_KIND,
                                 Utils.buildKind(ExampleServiceState.class))
                         .addFieldClause(
                                 ExampleServiceState.FIELD_NAME_NAME,
-                                "jane")
+                                emailPrefix)
                         .build());
-
+        setResourceGroupLink(exampleServiceResourceGroupLink);
         // Create resource group to allow access on ALL query tasks created by user
         String queryTaskResourceGroupLink =
                 createResourceGroup(target, "any-query-task-resource-group", Builder.create()
@@ -119,15 +266,16 @@ public class AuthorizationHelper {
                                 Utils.buildKind(QueryTask.class))
                         .addFieldClause(
                                 QueryTask.FIELD_NAME_AUTH_PRINCIPAL_LINK,
-                                USER_SERVICE_PATH)
+                                UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USERS, email))
                         .build());
 
         Collection<String> paths = new HashSet<>();
 
         // Create roles tying these together
-        paths.add(createRole(target, userGroupLink, exampleServiceResourceGroupLink,
-                new HashSet<>(Arrays.asList(Action.GET, Action.POST))));
-
+        String exampleRoleLink = createRole(target, userGroupLink, exampleServiceResourceGroupLink,
+                new HashSet<>(Arrays.asList(Action.GET, Action.POST)));
+        setRoleLink(exampleRoleLink);
+        paths.add(exampleRoleLink);
         // Create another role with PATCH permission to test if we calculate overall permissions correctly across roles.
         paths.add(createRole(target, userGroupLink, exampleServiceResourceGroupLink,
                 new HashSet<>(Collections.singletonList(Action.PATCH))));
@@ -135,13 +283,10 @@ public class AuthorizationHelper {
         // Create role authorizing access to the user's own query tasks
         paths.add(createRole(target, userGroupLink, queryTaskResourceGroupLink,
                 new HashSet<>(Arrays.asList(Action.GET, Action.POST, Action.PATCH, Action.DELETE))));
-
-        this.host.testWait();
-
         return paths;
     }
 
-    public String createUserGroup(ServiceHost target, String name, Query q) {
+    public String createUserGroup(ServiceHost target, String name, Query q) throws Throwable {
         URI postUserGroupsUri =
                 UriUtils.buildUri(target, ServiceUriPaths.CORE_AUTHZ_USER_GROUPS);
         String selfLink =
@@ -152,14 +297,13 @@ public class AuthorizationHelper {
         userGroupState.documentSelfLink = selfLink;
         userGroupState.query = q;
 
-        this.host.send(Operation
+        this.host.sendAndWaitExpectSuccess(Operation
                 .createPost(postUserGroupsUri)
-                .setBody(userGroupState)
-                .setCompletion(this.host.getCompletion()));
+                .setBody(userGroupState));
         return selfLink;
     }
 
-    public String createResourceGroup(ServiceHost target, String name, Query q) {
+    public String createResourceGroup(ServiceHost target, String name, Query q) throws Throwable {
         URI postResourceGroupsUri =
                 UriUtils.buildUri(target, ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS);
         String selfLink =
@@ -168,15 +312,13 @@ public class AuthorizationHelper {
         ResourceGroupState resourceGroupState = new ResourceGroupState();
         resourceGroupState.documentSelfLink = selfLink;
         resourceGroupState.query = q;
-
-        this.host.send(Operation
+        this.host.sendAndWaitExpectSuccess(Operation
                 .createPost(postResourceGroupsUri)
-                .setBody(resourceGroupState)
-                .setCompletion(this.host.getCompletion()));
+                .setBody(resourceGroupState));
         return selfLink;
     }
 
-    public String createRole(ServiceHost target, String userGroupLink, String resourceGroupLink, Set<Action> verbs) {
+    public String createRole(ServiceHost target, String userGroupLink, String resourceGroupLink, Set<Action> verbs) throws Throwable {
         // Build selfLink from user group, resource group, and verbs
         String userGroupSegment = userGroupLink.substring(userGroupLink.lastIndexOf('/') + 1);
         String resourceGroupSegment = resourceGroupLink.substring(resourceGroupLink.lastIndexOf('/') + 1);
@@ -196,12 +338,9 @@ public class AuthorizationHelper {
         roleState.resourceGroupLink = resourceGroupLink;
         roleState.verbs = verbs;
         roleState.policy = Policy.ALLOW;
-
-        this.host.send(Operation
+        this.host.sendAndWaitExpectSuccess(Operation
                 .createPost(UriUtils.buildUri(target, ServiceUriPaths.CORE_AUTHZ_ROLES))
-                .setBody(roleState)
-                .setCompletion(this.host.getCompletion()));
-
+                .setBody(roleState));
         return roleState.documentSelfLink;
     }
 }

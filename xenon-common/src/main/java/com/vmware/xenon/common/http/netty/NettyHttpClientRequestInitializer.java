@@ -14,7 +14,6 @@
 package com.vmware.xenon.common.http.netty;
 
 import java.util.logging.Level;
-
 import javax.net.ssl.SSLEngine;
 
 import io.netty.channel.ChannelHandlerContext;
@@ -37,10 +36,10 @@ import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2FrameLogger;
 import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.codec.http2.InboundHttp2ToHttpAdapter;
+import io.netty.handler.codec.http2.InboundHttp2ToHttpAdapterBuilder;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.ssl.SslHandler;
 
-import com.vmware.xenon.common.Operation.SocketContext;
 import com.vmware.xenon.common.Utils;
 
 /**
@@ -63,12 +62,15 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
     private final NettyChannelPool pool;
     private boolean isHttp2Only = false;
     private boolean debugLogging = false;
+    private int requestPayloadSizeLimit;
 
     public NettyHttpClientRequestInitializer(
             NettyChannelPool nettyChannelPool,
-            boolean isHttp2Only) {
+            boolean isHttp2Only,
+            int requestPayloadSizeLimit) {
         this.pool = nettyChannelPool;
         this.isHttp2Only = isHttp2Only;
+        this.requestPayloadSizeLimit = requestPayloadSizeLimit;
         NettyLoggingUtil.setupNettyLogging();
     }
 
@@ -93,7 +95,7 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
         HttpClientCodec http1_codec = new HttpClientCodec(
                 NettyChannelContext.MAX_INITIAL_LINE_LENGTH,
                 NettyChannelContext.MAX_HEADER_SIZE,
-                NettyChannelContext.MAX_CHUNK_SIZE, false);
+                NettyChannelContext.MAX_CHUNK_SIZE, false, false);
 
         // The HttpClientCodec combines the HttpRequestEncoder and the HttpResponseDecoder, and it
         // also provides a method for upgrading the protocol, which we use to support HTTP/2.
@@ -107,7 +109,7 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
                 HttpClientUpgradeHandler upgradeHandler = new HttpClientUpgradeHandler(
                         http1_codec,
                         upgradeCodec,
-                        SocketContext.getMaxClientRequestSize());
+                        this.requestPayloadSizeLimit);
 
                 p.addLast(UPGRADE_HANDLER, upgradeHandler);
                 p.addLast(UPGRADE_REQUEST, new UpgradeRequestHandler());
@@ -128,7 +130,7 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
             // The HttpObjectAggregator is not needed for HTTP/2. For HTTP/1.1 it
             // aggregates the HttpMessage and HttpContent into the FullHttpResponse
             p.addLast(AGGREGATOR_HANDLER,
-                    new HttpObjectAggregator(SocketContext.getMaxClientRequestSize()));
+                    new HttpObjectAggregator(this.requestPayloadSizeLimit));
         }
         p.addLast(XENON_HANDLER, new NettyHttpServerResponseHandler(this.pool));
     }
@@ -158,28 +160,26 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
     private NettyHttpToHttp2Handler makeHttp2ConnectionHandler() {
         // DefaultHttp2Connection is for client or server. False means "client".
         Http2Connection connection = new DefaultHttp2Connection(false);
-        InboundHttp2ToHttpAdapter inboundAdapter = new InboundHttp2ToHttpAdapter.Builder(connection)
-                .maxContentLength(NettyChannelContext.MAX_CHUNK_SIZE)
+        InboundHttp2ToHttpAdapter inboundAdapter = new InboundHttp2ToHttpAdapterBuilder(connection)
+                .maxContentLength(this.requestPayloadSizeLimit)
                 .propagateSettings(true)
                 .build();
         DelegatingDecompressorFrameListener frameListener = new DelegatingDecompressorFrameListener(
                 connection, inboundAdapter);
 
-        Http2FrameLogger frameLogger = null;
-        if (this.debugLogging) {
-            frameLogger = new Http2FrameLogger(LogLevel.INFO,
-                    NettyHttpClientRequestInitializer.class);
-        }
-
         Http2Settings settings = new Http2Settings();
-        settings.maxConcurrentStreams(this.pool.getConnectionLimitPerHost());
         settings.initialWindowSize(NettyChannelContext.INITIAL_HTTP2_WINDOW_SIZE);
 
-        NettyHttpToHttp2Handler connectionHandler = new NettyHttpToHttp2Handler.Builder()
+        NettyHttpToHttp2HandlerBuilder builder = new NettyHttpToHttp2HandlerBuilder()
+                .connection(connection)
                 .frameListener(frameListener)
-                .frameLogger(frameLogger)
-                .initialSettings(settings)
-                .build(connection);
+                .initialSettings(settings);
+        if (this.debugLogging) {
+            Http2FrameLogger frameLogger = new Http2FrameLogger(LogLevel.INFO,
+                    NettyHttpClientRequestInitializer.class);
+            builder.frameLogger(frameLogger);
+        }
+        NettyHttpToHttp2Handler connectionHandler = builder.build();
 
         return connectionHandler;
     }

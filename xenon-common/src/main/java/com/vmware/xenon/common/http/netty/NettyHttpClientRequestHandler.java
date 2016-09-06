@@ -20,7 +20,6 @@ import java.net.URISyntaxException;
 import java.util.Map.Entry;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
-
 import javax.net.ssl.SSLSession;
 
 import io.netty.buffer.ByteBuf;
@@ -46,6 +45,7 @@ import io.netty.util.AsciiString;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
+import com.vmware.xenon.common.Operation.OperationOption;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.ServiceHost;
@@ -65,9 +65,13 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
 
     private final SslHandler sslHandler;
 
-    public NettyHttpClientRequestHandler(ServiceHost host, SslHandler sslHandler) {
+    private int responsePayloadSizeLimit;
+
+    public NettyHttpClientRequestHandler(ServiceHost host, SslHandler sslHandler,
+            int responsePayloadSizeLimit) {
         this.host = host;
         this.sslHandler = sslHandler;
+        this.responsePayloadSizeLimit = responsePayloadSizeLimit;
     }
 
     @Override
@@ -83,6 +87,7 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         Operation request = null;
         Integer streamId = null;
         try {
+
             // Start of request processing, initialize in-bound operation
             FullHttpRequest nettyRequest = (FullHttpRequest) msg;
             long expMicros = Utils.getNowMicrosUtc() + this.host.getOperationTimeoutMicros();
@@ -96,13 +101,24 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
                 query = QueryStringDecoder.decodeComponent(targetUri.getQuery());
             }
 
-            URI uri = new URI(UriUtils.HTTP_SCHEME, null, ServiceHost.LOCAL_HOST,
+            URI uri = new URI(UriUtils.HTTP_SCHEME, targetUri.getUserInfo(), ServiceHost.LOCAL_HOST,
                     this.host.getPort(), targetUri.getPath(), query, null);
             request.setUri(uri);
 
-            // The streamId will be null for HTTP/1.1 connections, and valid for HTTP/2 connections
-            streamId = nettyRequest.headers().getInt(
-                    HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text());
+            // @see OperationOption.SEND_WITH_CALLBACK
+            String callbackLocation = getAndRemove(nettyRequest.headers(),
+                    Operation.REQUEST_CALLBACK_LOCATION_HEADER);
+            URI callbackUri = null;
+
+            if (callbackLocation == null) {
+                // The streamId will be null for HTTP/1.1 connections, and valid for HTTP/2 connections
+                streamId = nettyRequest.headers().getInt(
+                        HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text());
+            } else {
+                request.setReferer(callbackLocation);
+                callbackUri = new URI(callbackLocation);
+            }
+
             if (streamId == null) {
                 ctx.channel().attr(NettyChannelContext.OPERATION_KEY).set(request);
             }
@@ -117,7 +133,17 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             }
 
             parseRequestHeaders(ctx, request, nettyRequest);
-            decodeRequestBody(ctx, request, nettyRequest.content(), streamId);
+
+            if (callbackLocation != null) {
+                Operation localOp = request.clone();
+                // complete remote operation eagerly. We will PATCH the callback location with the
+                // result when the local operation completes
+                request.setStatusCode(Operation.STATUS_CODE_ACCEPTED).setBody(null);
+                sendResponse(ctx, request, null);
+                request = localOp;
+            }
+
+            decodeRequestBody(ctx, request, nettyRequest.content(), streamId, callbackUri);
         } catch (Throwable e) {
             this.host.log(Level.SEVERE, "Uncaught exception: %s", Utils.toString(e));
             if (request == null) {
@@ -133,11 +159,12 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         }
     }
 
-    private void decodeRequestBody(ChannelHandlerContext ctx, Operation request, ByteBuf content, Integer streamId) {
+    private void decodeRequestBody(ChannelHandlerContext ctx, Operation request,
+            ByteBuf content, Integer streamId, URI callbackUri) {
         if (!content.isReadable()) {
             // skip body decode, request had no body
             request.setContentLength(0);
-            submitRequest(ctx, request, streamId);
+            submitRequest(ctx, request, streamId, callbackUri);
             return;
         }
 
@@ -148,7 +175,8 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
                 sendResponse(ctx, request, streamId);
                 return;
             }
-            submitRequest(ctx, request, streamId);
+
+            submitRequest(ctx, request, streamId, callbackUri);
         });
 
         Utils.decodeBody(request, content.nioBuffer());
@@ -156,44 +184,81 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
 
     private void parseRequestHeaders(ChannelHandlerContext ctx, Operation request,
             HttpRequest nettyRequest) {
-        HttpHeaders headers = nettyRequest.headers();
 
-        String referer = getAndRemove(headers, HttpHeaderNames.REFERER);
+        HttpHeaders headers = nettyRequest.headers();
+        boolean hasHeaders = !headers.isEmpty();
+
+        String referer = getAndRemove(headers, Operation.REFERER_HEADER);
         if (referer != null) {
-            try {
-                request.setReferer(new URI(referer));
-            } catch (URISyntaxException e) {
-                setRefererFromSocketContext(ctx, request);
-            }
-        } else {
-            setRefererFromSocketContext(ctx, request);
+            request.setReferer(referer);
         }
 
-        if (headers.isEmpty()) {
+        if (!hasHeaders) {
             return;
         }
 
         request.setKeepAlive(HttpUtil.isKeepAlive(nettyRequest));
         if (HttpUtil.isContentLengthSet(nettyRequest)) {
             request.setContentLength(HttpUtil.getContentLength(nettyRequest));
+            getAndRemove(headers, Operation.CONTENT_LENGTH_HEADER);
+        }
+
+        String pragma = getAndRemove(headers, Operation.PRAGMA_HEADER);
+        if (Operation.PRAGMA_DIRECTIVE_REPLICATED.equals(pragma)) {
+            // replication requests will have a single PRAGMA directive. Set the right
+            // options and remove the header to avoid further allocations
+            request.setFromReplication(true).setTargetReplicated(true);
+        } else if (pragma != null) {
+            request.addRequestHeader(Operation.PRAGMA_HEADER, pragma);
+        }
+
+        if (request.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_REPLICATED)) {
+            // synchronization requests will have additional directives, so check again here
+            // if the request is replicated
+            request.setFromReplication(true).setTargetReplicated(true);
         }
 
         request.setContextId(getAndRemove(headers, Operation.CONTEXT_ID_HEADER));
 
-        String contentType = getAndRemove(headers, HttpHeaderNames.CONTENT_TYPE);
+        request.setTransactionId(getAndRemove(headers, Operation.TRANSACTION_ID_HEADER));
+
+        String contentType = getAndRemove(headers, Operation.CONTENT_TYPE_HEADER);
         if (contentType != null) {
             request.setContentType(contentType);
         }
 
-        String cookie = getAndRemove(headers, HttpHeaderNames.COOKIE);
+        String cookie = getAndRemove(headers, Operation.COOKIE_HEADER);
         if (cookie != null) {
             request.setCookies(CookieJar.decodeCookies(cookie));
         }
 
+        String host = getAndRemove(headers, Operation.HOST_HEADER);
+
         for (Entry<String, String> h : headers) {
             String key = h.getKey();
             String value = h.getValue();
+            if (Operation.STREAM_ID_HEADER.equals(key)) {
+                continue;
+            }
+            if (Operation.HTTP2_SCHEME_HEADER.equals(key)) {
+                continue;
+            }
+
             request.addRequestHeader(key, value);
+        }
+
+        if (host != null) {
+            request.addRequestHeader(Operation.HOST_HEADER, host);
+        }
+
+        if (request.getRequestHeader(Operation.RESPONSE_CALLBACK_STATUS_HEADER) != null) {
+            request.setReferer(request.getUri());
+        }
+
+        if (!request.hasReferer() && request.isFromReplication()) {
+            // we assume referrer is the same service, but from the remote node. Do not
+            // bother with rewriting the URI with the remote host, at avoid allocations
+            request.setReferer(request.getUri());
         }
 
         if (this.sslHandler == null) {
@@ -207,14 +272,8 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
                         session.getPeerCertificateChain());
             }
         } catch (Exception e) {
-            this.host.log(Level.FINE, "Failed to get peer principal " + Utils.toString(e));
+            this.host.log(Level.WARNING, "Failed to get peer principal " + Utils.toString(e));
         }
-    }
-
-    private String getAndRemove(HttpHeaders headers, AsciiString headerName) {
-        String headerValue = headers.get(headerName.toString());
-        headers.remove(headerName);
-        return headerValue;
     }
 
     private String getAndRemove(HttpHeaders headers, String headerName) {
@@ -223,16 +282,22 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         return headerValue;
     }
 
-    private void submitRequest(ChannelHandlerContext ctx, Operation request, Integer streamId) {
+    private void submitRequest(ChannelHandlerContext ctx, Operation request,
+            Integer streamId, URI callbackLocation) {
         request.nestCompletion((o, e) -> {
             request.setBodyNoCloning(o.getBodyRaw());
             sendResponse(ctx, request, streamId);
         });
 
-        request.setCloningDisabled(true);
+        request.toggleOption(OperationOption.CLONING_DISABLED, true);
+
+        if (!request.hasReferer()) {
+            setRefererFromSocketContext(ctx, request);
+        }
+
         Operation localOp = request;
-        if (request.getRequestCallbackLocation() != null) {
-            localOp = processRequestWithCallback(request);
+        if (callbackLocation != null) {
+            localOp = processRequestWithCallback(request, callbackLocation);
         }
 
         this.host.handleRequest(null, localOp);
@@ -245,41 +310,17 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
      * <p/>
      * 2) Create a new local operation, cloned from the remote peer op, and set a completion that
      * will generate a PATCH to the remote callback location
-     *
-     * @param op
-     * @return
      */
-    private Operation processRequestWithCallback(Operation op) {
-        final URI[] targetCallback = { null };
-        try {
-            targetCallback[0] = new URI(op.getRequestCallbackLocation());
-        } catch (URISyntaxException e1) {
-            op.fail(e1);
-            return null;
-        }
-
-        Operation localOp = op.clone();
-
-        // complete remote operation eagerly. We will PATCH the callback location with the
-        // result when the local operation completes
-        op.setStatusCode(Operation.STATUS_CODE_ACCEPTED).setBody(null).complete();
-
+    private Operation processRequestWithCallback(Operation localOp, URI callbackLocation) {
         localOp.setCompletion((o, e) -> {
-            Operation patchForCompletion = Operation.createPatch(targetCallback[0])
+            Operation patchForCompletion = Operation.createPatch(callbackLocation)
                     .setReferer(o.getUri());
             int responseStatusCode = o.getStatusCode();
-            if (e != null) {
-                ServiceErrorResponse rsp = Utils.toServiceErrorResponse(e);
-                rsp.statusCode = responseStatusCode;
-                patchForCompletion.setBody(rsp);
+            if (!o.hasBody()) {
+                patchForCompletion.setBodyNoCloning(Operation.EMPTY_JSON_BODY);
             } else {
-                if (!o.hasBody()) {
-                    patchForCompletion.setBodyNoCloning(Operation.EMPTY_JSON_BODY);
-                } else {
-                    patchForCompletion.setBodyNoCloning(o.getBodyRaw());
-                }
+                patchForCompletion.setBodyNoCloning(o.getBodyRaw());
             }
-
             patchForCompletion.transferResponseHeadersToRequestHeadersFrom(o);
             patchForCompletion.addRequestHeader(
                     Operation.RESPONSE_CALLBACK_STATUS_HEADER,
@@ -301,32 +342,26 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
     private void writeResponseUnsafe(ChannelHandlerContext ctx, Operation request, Integer streamId) {
         ByteBuf bodyBuffer = null;
         FullHttpResponse response;
+
         try {
             byte[] data = Utils.encodeBody(request);
+
+            // if some service returns a response that is greater than the maximum allowed size,
+            // we return an INTERNAL_SERVER_ERROR.
+            if (request.getContentLength() > this.responsePayloadSizeLimit) {
+                String errorMessage = "Content-Length " + request.getContentLength()
+                        + " is greater than max size allowed " + this.responsePayloadSizeLimit;
+                this.host.log(Level.SEVERE, errorMessage);
+                writeInternalServerError(ctx, request, streamId, errorMessage);
+                return;
+            }
             if (data != null) {
                 bodyBuffer = Unpooled.wrappedBuffer(data);
             }
         } catch (Throwable e1) {
             // Note that this is a program logic error - some service isn't properly checking or setting Content-Type
             this.host.log(Level.SEVERE, "Error encoding body: %s", Utils.toString(e1));
-            byte[] data;
-            try {
-                data = ("Error encoding body: " + e1.getMessage()).getBytes(Utils.CHARSET);
-            } catch (UnsupportedEncodingException ueex) {
-                this.exceptionCaught(ctx, ueex);
-                return;
-            }
-            response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
-                    HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    Unpooled.wrappedBuffer(data), false, false);
-            if (streamId != null) {
-                response.headers().setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(),
-                        streamId);
-            }
-            response.headers().set(HttpHeaderNames.CONTENT_TYPE, Operation.MEDIA_TYPE_TEXT_HTML);
-            response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH,
-                    response.content().readableBytes());
-            writeResponse(ctx, request, response);
+            writeInternalServerError(ctx, request, streamId, "Error encoding body: " + e1.getMessage());
             return;
         }
 
@@ -350,9 +385,11 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH,
                 response.content().readableBytes());
 
-        // add any other custom headers associated with operation
-        for (Entry<String, String> nameValue : request.getResponseHeaders().entrySet()) {
-            response.headers().set(nameValue.getKey(), nameValue.getValue());
+        if (request.hasResponseHeaders()) {
+            // add any other custom headers associated with operation
+            for (Entry<String, String> nameValue : request.getResponseHeaders().entrySet()) {
+                response.headers().set(nameValue.getKey(), nameValue.getValue());
+            }
         }
 
         // Add auth token to response if authorization context
@@ -365,7 +402,7 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
 
             // Client can also use the cookie if they prefer
             StringBuilder buf = new StringBuilder()
-                    .append(AuthenticationConstants.XENON_JWT_COOKIE)
+                    .append(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE)
                     .append('=')
                     .append(token);
 
@@ -383,9 +420,31 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         writeResponse(ctx, request, response);
     }
 
+    private void writeInternalServerError(ChannelHandlerContext ctx, Operation request, Integer streamId, String err) {
+        byte[] data;
+        try {
+            data = err.getBytes(Utils.CHARSET);
+        } catch (UnsupportedEncodingException ueex) {
+            this.exceptionCaught(ctx, ueex);
+            return;
+        }
+
+        FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
+                HttpResponseStatus.INTERNAL_SERVER_ERROR,
+                Unpooled.wrappedBuffer(data), false, false);
+        if (streamId != null) {
+            response.headers().setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(),
+                    streamId);
+        }
+        response.headers().set(HttpHeaderNames.CONTENT_TYPE, Operation.MEDIA_TYPE_TEXT_HTML);
+        response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
+        writeResponse(ctx, request, response);
+        return;
+    }
+
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        Operation op = ctx.attr(NettyChannelContext.OPERATION_KEY).get();
+        Operation op = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).get();
         if (op != null) {
             this.host.log(Level.SEVERE,
                     "HTTP/1.1 listener channel exception: %s, in progress op: %s",

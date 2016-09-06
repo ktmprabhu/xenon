@@ -23,10 +23,12 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.Operation.OperationOption;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocument.DocumentRelationship;
@@ -165,6 +167,7 @@ public class NodeSelectorSynchronizationService extends StatelessService {
         }
 
         ServiceDocument bestPeerRsp = null;
+        boolean incrementEpoch = false;
 
         TreeMap<Long, List<ServiceDocument>> syncRspsPerEpoch = new TreeMap<>();
         Map<URI, ServiceDocument> peerStates = new HashMap<>();
@@ -191,6 +194,10 @@ public class NodeSelectorSynchronizationService extends StatelessService {
                 syncRspsPerEpoch.put(peerState.documentEpoch, statesForEpoch);
             }
             statesForEpoch.add(peerState);
+
+            if (!request.ownerNodeId.equals(peerState.documentOwner)) {
+                incrementEpoch = true;
+            }
         }
 
         // As part of synchronization we need to detect what peer services do not have the best state.
@@ -207,8 +214,6 @@ public class NodeSelectorSynchronizationService extends StatelessService {
             }
             peerStates.put(remotePeerService, new ServiceDocument());
         }
-
-        boolean incrementEpoch = false;
 
         if (!syncRspsPerEpoch.isEmpty()) {
             List<ServiceDocument> statesForHighestEpoch = syncRspsPerEpoch.get(syncRspsPerEpoch
@@ -242,6 +247,19 @@ public class NodeSelectorSynchronizationService extends StatelessService {
                     bestPeerRsp, request.stateDescription, Utils.getTimeComparisonEpsilonMicros());
         }
 
+        if (bestPeerRsp == null &&
+                request.options.contains(ServiceOption.ON_DEMAND_LOAD)) {
+            // For ODL services we only synchronize at access time.
+            // If the service is not found on the OWNER node, the
+            // owner will kick off synchronization to check if
+            // any of the peers has the requested service. Since none
+            // of the peers had the requested state we return 404.
+            post.setStatusCode(Operation.STATUS_CODE_NOT_FOUND);
+            post.setBody(null);
+            post.complete();
+            return;
+        }
+
         if (results.contains(DocumentRelationship.IN_CONFLICT)) {
             markServiceInConflict(request.state, bestPeerRsp);
             // if we detect conflict, we will synchronize local service with selected peer state
@@ -267,10 +285,6 @@ public class NodeSelectorSynchronizationService extends StatelessService {
             logInfo("Using best peer state %s", Utils.toJson(bestPeerRsp));
         }
 
-        // increment epoch if owner changed
-        if (bestPeerRsp.documentOwner != null) {
-            incrementEpoch = !request.ownerNodeId.equals(bestPeerRsp.documentOwner);
-        }
         bestPeerRsp.documentOwner = request.ownerNodeId;
 
         broadcastBestState(rsp.selectedNodes, peerStates, post, request, bestPeerRsp,
@@ -323,7 +337,12 @@ public class NodeSelectorSynchronizationService extends StatelessService {
                 if (r != 0) {
                     return;
                 }
-                post.complete();
+
+                // if we are not the owner, request has already completed, before we even sent
+                // the requests
+                if (request.isOwner) {
+                    post.complete();
+                }
             });
 
             if (incrementEpoch) {
@@ -335,41 +354,27 @@ public class NodeSelectorSynchronizationService extends StatelessService {
 
             post.setBody(bestPeerRsp);
 
+            // if we are not the owner, complete operation, to avoid deadlock:
+            // if we send a POST which converts to a PUT, on the actual owner of the service, it will
+            // attempt to synchronize with this host, but since we are blocked waiting for it, we deadlock
+            if (!request.isOwner) {
+                post.complete();
+            }
+
             ServiceDocument clonedState = Utils.clone(bestPeerRsp);
             for (Entry<URI, ServiceDocument> entry : peerStates.entrySet()) {
-
                 URI peer = entry.getKey();
+                ServiceDocument peerState = entry.getValue();
 
-                URI targetFactoryUri = UriUtils.buildUri(peer, request.factoryLink);
-                Operation peerOp = Operation.createPost(targetFactoryUri)
-                        .setReferer(post.getReferer()).setExpiration(post.getExpirationMicrosUtc())
-                        .setCompletion(c);
+                Operation peerOp = prepareSynchPostRequest(post, request, bestState,
+                        isServiceDeleted, c, clonedState, peer);
 
-                // Mark it as replicated so the remote factories do not try to replicate it again
-                peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_REPLICATED);
-
-                // Request a version check to prevent restarting/recreating a service that might
-                // have been deleted
-                peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERSION_CHECK);
-
-                // indicate this is a synchronization request.
-                peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH);
-
-                peerOp.addRequestHeader(Operation.REPLICATION_PHASE_HEADER,
-                        Operation.REPLICATION_PHASE_COMMIT);
-
-                //  must get started on peers, regardless if the index has it. Since only one node is doing
-                // synchronization, its responsible for starting the children on ALL nodes. If this is a synchronization
-                // due to a node joining or leaving and some peers have already started the service, the POST will
-                // automatically get converted to a PUT, if the factory is IDEMPOTENT. Otherwise, it will fail
-                clonedState.documentSelfLink = bestState.documentSelfLink.replace(
-                        request.factoryLink, "");
-
-                if (isServiceDeleted) {
-                    peerOp.setAction(Action.DELETE);
+                if (!incrementEpoch
+                        && bestPeerRsp.getClass().equals(peerState.getClass())
+                        && ServiceDocument.equals(request.stateDescription, bestPeerRsp, peerState)) {
+                    skipSynchOrStartServiceOnPeer(peerOp, peerState.documentSelfLink, request);
+                    continue;
                 }
-
-                peerOp.setBody(clonedState);
 
                 if (this.isDetailedLoggingEnabled) {
                     logInfo("(isOwner: %s)(remaining: %d) (last action: %s) Sending %s with best state for %s to %s (e:%d, v:%d)",
@@ -388,6 +393,74 @@ public class NodeSelectorSynchronizationService extends StatelessService {
             logSevere(e);
             post.fail(e);
         }
+    }
+
+    /**
+     * The service state on the peer node is identical to best state. We should
+     * skip sending a synchronization POST, if the service is already started
+     */
+    private void skipSynchOrStartServiceOnPeer(Operation peerOp, String link, SynchronizePeersRequest request) {
+        // If the service is an ON_DEMAND_LOAD service, we don't bother trying to
+        // start it on the peer host. It will get started on-demand when a request comes in.
+        if (request.options.contains(ServiceOption.ON_DEMAND_LOAD)) {
+            peerOp.complete();
+            return;
+        }
+
+        Operation checkGet = Operation.createGet(UriUtils.buildUri(peerOp.getUri(), link))
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_FORWARDING)
+                .setConnectionSharing(true)
+                .setExpiration(Utils.getNowMicrosUtc() + TimeUnit.SECONDS.toMicros(2))
+                .setCompletion((o, e) -> {
+                    if (e == null) {
+                        if (this.isDetailedLoggingEnabled) {
+                            logInfo("Skipping %s , state identical with best state", o.getUri());
+                        }
+                        peerOp.complete();
+                        return;
+                    }
+                    // service does not seem to exist, issue POST to start it
+                    sendRequest(peerOp);
+                });
+        sendRequest(checkGet);
+    }
+
+    private Operation prepareSynchPostRequest(Operation post, SynchronizePeersRequest request,
+            final ServiceDocument bestState, boolean isServiceDeleted, CompletionHandler c,
+            ServiceDocument clonedState, URI peer) {
+        URI targetFactoryUri = UriUtils.buildUri(peer, request.factoryLink);
+        Operation peerOp = Operation.createPost(targetFactoryUri)
+                .transferRefererFrom(post).setExpiration(post.getExpirationMicrosUtc())
+                .setCompletion(c);
+
+        peerOp.toggleOption(OperationOption.CONNECTION_SHARING, true);
+
+        // Mark it as replicated so the remote factories do not try to replicate it again
+        peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_REPLICATED);
+
+        // Request a version check to prevent restarting/recreating a service that might
+        // have been deleted
+        peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERSION_CHECK);
+
+        // indicate this is a synchronization request.
+        peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH);
+
+        peerOp.addRequestHeader(Operation.REPLICATION_PHASE_HEADER,
+                Operation.REPLICATION_PHASE_COMMIT);
+
+        //  must get started on peers, regardless if the index has it. Since only one node is doing
+        // synchronization, its responsible for starting the children on ALL nodes. If this is a synchronization
+        // due to a node joining or leaving and some peers have already started the service, the POST will
+        // automatically get converted to a PUT, if the factory is IDEMPOTENT. Otherwise, it will fail
+        clonedState.documentSelfLink = bestState.documentSelfLink.replace(
+                request.factoryLink, "");
+
+        if (isServiceDeleted) {
+            peerOp.setAction(Action.DELETE);
+        }
+
+        peerOp.setBody(clonedState);
+        return peerOp;
     }
 
     private void markServiceInConflict(ServiceDocument state, ServiceDocument bestPeerRsp) {

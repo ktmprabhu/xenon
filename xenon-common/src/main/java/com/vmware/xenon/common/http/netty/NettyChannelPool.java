@@ -14,17 +14,16 @@
 package com.vmware.xenon.common.http.netty;
 
 import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.Objects;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeoutException;
-
+import java.util.logging.Logger;
 import javax.net.ssl.SSLContext;
 
 import io.netty.bootstrap.Bootstrap;
@@ -37,6 +36,7 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
 
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.ServiceClient;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
@@ -46,46 +46,109 @@ import com.vmware.xenon.common.Utils;
  */
 public class NettyChannelPool {
 
+    public static class NettyChannelGroupKey implements Comparable<NettyChannelGroupKey> {
+        private final String connectionTag;
+        private final String host;
+        private final int port;
+        private int hashcode;
+
+        public NettyChannelGroupKey(String tag, String host, int port, boolean isHttp2) {
+            if (tag == null) {
+                tag = isHttp2 ? ServiceClient.CONNECTION_TAG_HTTP2_DEFAULT
+                        : ServiceClient.CONNECTION_TAG_DEFAULT;
+            }
+            this.connectionTag = tag;
+            // a null host is not valid but we do URI validation elsewhere. If we are called with null host
+            // here it means we are trying to fail the operation that failed the validation, so use empty string
+            this.host = host == null ? "" : host;
+            if (port <= 0) {
+                port = UriUtils.HTTP_DEFAULT_PORT;
+            }
+            this.port = port;
+        }
+
+        @Override
+        public String toString() {
+            return this.connectionTag + ":" + this.host + ":" + this.port;
+        }
+
+        @Override
+        public int hashCode() {
+            if (this.hashcode == 0) {
+                this.hashcode = Objects.hash(this.connectionTag, this.host, this.port);
+            }
+            return this.hashcode;
+        }
+
+        @Override
+        public int compareTo(NettyChannelGroupKey o) {
+            int r = Integer.compare(this.port, o.port);
+            if (r != 0) {
+                return r;
+            }
+            r = this.connectionTag.compareTo(o.connectionTag);
+            if (r != 0) {
+                return r;
+            }
+            return this.host.compareTo(o.host);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof NettyChannelGroupKey)) {
+                return false;
+            }
+            NettyChannelGroupKey otherKey = (NettyChannelGroupKey) other;
+            return compareTo(otherKey) == 0;
+        }
+    }
+
     public static class NettyChannelGroup {
-        // available and inUse channels are for when we have an HTTP/1.1 connection
-        // while the http2Channels are for an HTTP/2 channel. We could reuse available
-        // channels for both, but this keeps it a bit more clear.
-        public List<NettyChannelContext> availableChannels = new ArrayList<>();
-        public Set<NettyChannelContext> inUseChannels = new HashSet<>();
+        private NettyChannelGroupKey key;
 
-        // In general, we're only using a single http2Channel at a time, but
-        // we make a new channel when the existing channel has exhausted it's
-        // streams (stream identifiers can't be reused). Typically, this list
-        // will have a single channel in it, and will briefly have two channels
-        // when switching to a new channel: we need to wait for pending operations
-        // to complete before we close the exhausted channel.
-        public List<NettyChannelContext> http2Channels = new ArrayList<>();
-        public List<Operation> pendingRequests = new ArrayList<>();
+        public NettyChannelGroup(NettyChannelGroupKey key) {
+            this.key = key;
+        }
+
+        public NettyChannelGroupKey getKey() {
+            return this.key;
+        }
+
+        // Available channels are for when we have an HTTP/1.1 connection
+        public Queue<NettyChannelContext> availableChannels = new ConcurrentLinkedQueue<>();
+
+        public List<NettyChannelContext> inUseChannels = new ArrayList<>();
+        public Queue<Operation> pendingRequests = new ConcurrentLinkedQueue<>();
     }
 
-    private static final long CHANNEL_EXPIRATION_MICROS =
-            ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS * 2;
+    public static final Logger LOGGER = Logger.getLogger(NettyChannelPool.class
+            .getName());
 
-    public static String toConnectionKey(String host, int port) {
-        return host + port;
-    }
+    private static final long CHANNEL_EXPIRATION_MICROS = Long.getLong(
+            Utils.PROPERTY_NAME_PREFIX + "NettyChannelPool.CHANNEL_EXPIRATION_MICROS",
+            ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS * 10);
 
-    private final ExecutorService executor;
     private ExecutorService nettyExecutorService;
+    private ExecutorService executor;
     private EventLoopGroup eventGroup;
     private String threadTag = NettyChannelPool.class.getSimpleName();
     private int threadCount;
     private boolean isHttp2Only = false;
-
     private Bootstrap bootStrap;
 
-    private final Map<String, NettyChannelGroup> channelGroups = new ConcurrentSkipListMap<>();
+    private final Map<NettyChannelGroupKey, NettyChannelGroup> channelGroups = new ConcurrentSkipListMap<>();
+    private Map<String, Integer> connectionLimitsPerTag = new ConcurrentSkipListMap<>();
+
     private int connectionLimit = 1;
 
     private SSLContext sslContext;
 
-    public NettyChannelPool(ExecutorService executor) {
-        this.executor = executor;
+    private int requestPayloadSizeLimit;
+
+    public NettyChannelPool() {
     }
 
     public NettyChannelPool setThreadTag(String tag) {
@@ -95,6 +158,11 @@ public class NettyChannelPool {
 
     public NettyChannelPool setThreadCount(int count) {
         this.threadCount = count;
+        return this;
+    }
+
+    public NettyChannelPool setExecutor(ExecutorService es) {
+        this.executor = es;
         return this;
     }
 
@@ -118,26 +186,25 @@ public class NettyChannelPool {
             return;
         }
 
-        this.nettyExecutorService = Executors.newFixedThreadPool(this.threadCount, r -> new Thread(r, this.threadTag));
-        this.eventGroup = new NioEventLoopGroup(this.threadCount, this.nettyExecutorService);
+        if (this.executor == null) {
+            this.nettyExecutorService = Executors.newFixedThreadPool(this.threadCount,
+                    r -> new Thread(
+                            r, this.threadTag));
+            this.executor = this.nettyExecutorService;
+        }
+        this.eventGroup = new NioEventLoopGroup(this.threadCount, this.executor);
 
         this.bootStrap = new Bootstrap();
         this.bootStrap.group(this.eventGroup)
                 .channel(NioSocketChannel.class)
-                .handler(new NettyHttpClientRequestInitializer(this, this.isHttp2Only));
+                .handler(new NettyHttpClientRequestInitializer(this, this.isHttp2Only,
+                        this.requestPayloadSizeLimit));
     }
 
     public boolean isStarted() {
         return this.bootStrap != null;
     }
 
-    /**
-     * For an HTTP/1.1 connection, the number of actual connections per host
-     * For an HTTP/2 connection, the number of streams per connection. (We have one connection
-     *   per host)
-     * @param limit
-     * @return
-     */
     public NettyChannelPool setConnectionLimitPerHost(int limit) {
         this.connectionLimit = limit;
         return this;
@@ -147,12 +214,34 @@ public class NettyChannelPool {
         return this.connectionLimit;
     }
 
-    private NettyChannelGroup getChannelGroup(String key) {
+    public void setConnectionLimitPerTag(String tag, int limit) {
+        this.connectionLimitsPerTag.put(tag, limit);
+    }
+
+    public int getConnectionLimitPerTag(String tag) {
+        return this.connectionLimitsPerTag.getOrDefault(tag,
+                ServiceClient.DEFAULT_CONNECTION_LIMIT_PER_TAG);
+    }
+
+    public void setRequestPayloadSizeLimit(int requestPayloadSizeLimit) {
+        this.requestPayloadSizeLimit = requestPayloadSizeLimit;
+    }
+
+    public int getRequestPayloadSizeLimit() {
+        return this.requestPayloadSizeLimit;
+    }
+
+    private NettyChannelGroup getChannelGroup(String tag, String host, int port) {
+        NettyChannelGroupKey key = new NettyChannelGroupKey(tag, host, port, this.isHttp2Only);
+        return getChannelGroup(key);
+    }
+
+    private NettyChannelGroup getChannelGroup(NettyChannelGroupKey key) {
         NettyChannelGroup group;
         synchronized (this.channelGroups) {
             group = this.channelGroups.get(key);
             if (group == null) {
-                group = new NettyChannelGroup();
+                group = new NettyChannelGroup(key);
                 this.channelGroups.put(key, group);
             }
         }
@@ -160,36 +249,29 @@ public class NettyChannelPool {
     }
 
     public long getPendingRequestCount(Operation op) {
-        String key = toConnectionKey(op.getUri().getHost(), op.getUri().getPort());
-        NettyChannelGroup group = getChannelGroup(key);
+        NettyChannelGroup group = getChannelGroup(op.getConnectionTag(), op.getUri().getHost(), op
+                .getUri()
+                .getPort());
         return group.pendingRequests.size();
     }
 
-    public void connectOrReuse(String host, int port, Operation request) {
+    public void connectOrReuse(NettyChannelGroupKey key, Operation request) {
 
         if (request == null) {
             throw new IllegalArgumentException("request is required");
         }
 
-        if (host == null) {
-            request.fail(new IllegalArgumentException("host is required"));
+        if (key == null) {
+            request.fail(new IllegalArgumentException("connection key is required"));
             return;
         }
 
-        if (port <= 0) {
-            port = UriUtils.HTTP_DEFAULT_PORT;
-        }
-
         try {
-            String key = toConnectionKey(host, port);
             NettyChannelGroup group = getChannelGroup(key);
-            final NettyChannelContext context = selectContext(group, host, port, key);
+            final NettyChannelContext context = selectContext(request, group);
 
             if (context == null) {
-                // We have no available connections, so queue the request.
-                synchronized (group) {
-                    group.pendingRequests.add(request);
-                }
+                // We have no available connections, request has been queued
                 return;
             }
 
@@ -200,26 +282,9 @@ public class NettyChannelPool {
                 return;
             }
 
-            // Sometimes when an HTTP/2 connection is exhausted and we open
-            // a new connection, the connection fails: it appears that the client
-            // believes it has sent the HTTP/2 settings frame, but the server has
-            // not received it. After hours of debugging, I don't believe the cause
-            // is our fault, but haven't isolated an underlying bug in Netty either.
-            //
-            // The workaround is that retry the connection. I haven't yet seen a failure
-            // when we retry.
-            //
-            // This doesn't make me completely comfortable. Is it really the case that
-            // we just occasionally lose the SETTINGS frame on a new connection, or can
-            // other frames be lost? Until we are sure, HTTP/2 support should be considered
-            // experimental.
-            if (this.isHttp2Only && request.getRetryCount() == 0) {
-                request.setRetryCount(2);
-            }
-
             // Connect, then wait for the connection to complete before either
             // sending data (HTTP/1.1) or negotiating settings (HTTP/2)
-            ChannelFuture connectFuture = this.bootStrap.connect(context.host, context.port);
+            ChannelFuture connectFuture = this.bootStrap.connect(key.host, key.port);
             connectFuture.addListener(new ChannelFutureListener() {
 
                 @Override
@@ -235,9 +300,10 @@ public class NettyChannelPool {
 
                             // We also note that this is an HTTP2 channel--it simplifies some other code
                             channel.attr(NettyChannelContext.HTTP2_KEY).set(true);
-
                             waitForSettings(channel, context, request, group);
                         } else {
+                            context.setOpenInProgress(false);
+                            context.setChannel(channel).setOperation(request);
                             sendAfterConnect(channel, context, request, null);
                         }
                     } else {
@@ -258,38 +324,35 @@ public class NettyChannelPool {
      * an exhausted connection that hasn't been cleaned up yet.
      * This is intended for infrastructure test purposes.
      */
-    public int getHttp2ActiveContextCount(String host, int port) {
+    public int getHttp2ActiveContextCount(String tag, String host, int port) {
         if (!this.isHttp2Only) {
             throw new IllegalStateException(
                     "Internal error: can't get HTTP/2 information about HTTP/1 context");
         }
-
-        String key = toConnectionKey(host, port);
-        NettyChannelGroup group = getChannelGroup(key);
-        return group.http2Channels.size();
+        NettyChannelGroup group = getChannelGroup(tag, host, port);
+        return group.inUseChannels.size();
     }
 
     /**
      * Find the first valid HTTP/2 context that is being used to talk to a given host.
      * This is intended for infrastructure test purposes.
      */
-    public NettyChannelContext getFirstValidHttp2Context(String host, int port) {
+    public NettyChannelContext getFirstValidHttp2Context(String tag, String host, int port) {
         if (!this.isHttp2Only) {
             throw new IllegalStateException(
                     "Internal error: can't get HTTP/2 information about HTTP/1 context");
         }
 
-        String key = toConnectionKey(host, port);
-        NettyChannelGroup group = getChannelGroup(key);
-        NettyChannelContext context = selectHttp2Context(group, host, port, key);
+        NettyChannelGroup group = getChannelGroup(tag, host, port);
+        NettyChannelContext context = selectHttp2Context(null, group, "");
         return context;
     }
 
-    private NettyChannelContext selectContext(NettyChannelGroup group, String host, int port, String key) {
+    private NettyChannelContext selectContext(Operation op, NettyChannelGroup group) {
         if (this.isHttp2Only) {
-            return selectHttp2Context(group, host, port, key);
+            return selectHttp2Context(op, group, op.getUri().getPath());
         } else {
-            return selectHttp11Context(group, host, port, key);
+            return selectHttp11Context(op, group);
         }
     }
 
@@ -306,42 +369,66 @@ public class NettyChannelPool {
      * happens when the channel is already being opened. The caller will
      * queue the request to be sent after the connection is open.
      */
-    private NettyChannelContext selectHttp2Context(
-            NettyChannelGroup group, String host, int port, String key) {
-        NettyChannelContext http2Channel = null;
+    private NettyChannelContext selectHttp2Context(Operation request, NettyChannelGroup group,
+            String link) {
+        NettyChannelContext context = null;
+        NettyChannelContext badContext = null;
+        int limit = this.getConnectionLimitPerTag(group.getKey().connectionTag);
         synchronized (group) {
-            // Find a channel that's not exhausted, if any.
-            for (NettyChannelContext channel : group.http2Channels) {
-                if (channel.isValid()) {
-                    http2Channel = channel;
-                    break;
+            if (!group.inUseChannels.isEmpty()) {
+                // Increase locality: we want to re-use a HTTP2 context, for the same target link
+                int index = Math.abs(link.hashCode() % group.inUseChannels.size());
+                NettyChannelContext ctx = group.inUseChannels.get(index);
+                if (ctx.isValid()) {
+                    context = ctx;
+                } else {
+                    LOGGER.info(ctx.getLargestStreamId() + ":" + group.getKey());
                 }
             }
-            if (http2Channel != null && http2Channel.getOpenInProgress()) {
-                // If the channel is being opened, indicate that caller should
-                // queue the operation to be delivered later.
-                return null;
+
+            if (context != null) {
+                if (context.isOpenInProgress() || !group.pendingRequests.isEmpty()) {
+                    // If the channel is being opened, indicate that caller should
+                    // queue the operation to be delivered later.
+                    group.pendingRequests.add(request);
+                    return null;
+                }
             }
 
-            if (http2Channel == null) {
-                // If there was no channel, open one
-                http2Channel = new NettyChannelContext(host, port, key,
-                        NettyChannelContext.Protocol.HTTP2);
-                http2Channel.setOpenInProgress(true);
-                group.http2Channels.add(http2Channel);
-            } else if (http2Channel.getChannel() != null
-                    && !http2Channel.getChannel().isOpen()) {
-                // We found an channel, but it's in a bad state. Replace it.
-                http2Channel.close();
-                group.http2Channels.remove(http2Channel);
-                http2Channel = new NettyChannelContext(host, port, key,
-                        NettyChannelContext.Protocol.HTTP2);
-                http2Channel.setOpenInProgress(true);
-                group.http2Channels.add(http2Channel);
+            int activeChannelCount = group.inUseChannels.size();
+            if (context != null && context.hasActiveStreams()
+                    && activeChannelCount < limit) {
+                // create a new channel, we are below limit for concurrent connections
+                context = null;
+            } else if (context == null) {
+                // This is rare: do a search until we find a valid channel, the modulo scheme did
+                // not produce a valid context
+                for (NettyChannelContext ctx : group.inUseChannels) {
+                    if (ctx.isValid()) {
+                        context = ctx;
+                        break;
+                    }
+                }
             }
-            http2Channel.updateLastUseTime();
+
+            if (context != null && context.getChannel() != null
+                    && !context.getChannel().isOpen()) {
+                badContext = context;
+                context = null;
+            }
+
+            if (context == null) {
+                // If there was no channel, open one
+                context = new NettyChannelContext(group.getKey(),
+                        NettyChannelContext.Protocol.HTTP2);
+                context.setOpenInProgress(true);
+                group.inUseChannels.add(context);
+            }
         }
-        return http2Channel;
+
+        closeBadChannelContext(badContext);
+        context.updateLastUseTime();
+        return context;
     }
 
     /**
@@ -349,36 +436,45 @@ public class NettyChannelPool {
      * at a time per context, so one may not be available. If one isn't, we return null
      * to indicate that the request needs to be queued to be sent later.
      */
-    private NettyChannelContext selectHttp11Context(
-            NettyChannelGroup group, String host, int port, String key) {
-        NettyChannelContext context = null;
+    private NettyChannelContext selectHttp11Context(Operation request, NettyChannelGroup group) {
+        NettyChannelContext context = group.availableChannels.poll();
+        NettyChannelContext badContext = null;
 
         synchronized (group) {
-            if (!group.availableChannels.isEmpty()) {
-                context = group.availableChannels
-                        .remove(group.availableChannels.size() - 1);
-                context.updateLastUseTime();
-            } else if (group.inUseChannels.size() >= this.connectionLimit) {
-                return null;
-            } else {
-                context = new NettyChannelContext(host, port, key,
+            if (context == null) {
+                int limit = getConnectionLimitPerTag(group.getKey().connectionTag);
+                if (group.inUseChannels.size() >= limit) {
+                    group.pendingRequests.add(request);
+                    return null;
+                }
+                context = new NettyChannelContext(group.getKey(),
                         NettyChannelContext.Protocol.HTTP11);
+                context.setOpenInProgress(true);
             }
 
             // It's possible that we've selected a channel that we think is open, but
             // it's not. If so, it's a bad context, so recreate it.
-            if (context.getChannel() != null) {
-                if (!context.getChannel().isOpen()) {
-                    context.close();
-                    context = new NettyChannelContext(host, port, key,
-                            NettyChannelContext.Protocol.HTTP11);
-                }
+            if (context.getChannel() != null && !context.getChannel().isOpen()) {
+                badContext = context;
+                context = new NettyChannelContext(group.getKey(),
+                        NettyChannelContext.Protocol.HTTP11);
+                context.setOpenInProgress(true);
             }
-
             group.inUseChannels.add(context);
         }
-        return context;
 
+        closeBadChannelContext(badContext);
+        context.updateLastUseTime();
+        return context;
+    }
+
+    private void closeBadChannelContext(NettyChannelContext badContext) {
+        if (badContext == null) {
+            return;
+        }
+        Logger.getAnonymousLogger().info(
+                "replacing channel in bad state: " + badContext.toString());
+        returnOrClose(badContext, true);
     }
 
     /**
@@ -394,7 +490,24 @@ public class NettyChannelPool {
                     throws Exception {
 
                 if (future.isSuccess()) {
+
+                    // retrieve pending operations
+                    List<Operation> pendingOps = new ArrayList<>();
+                    synchronized (group) {
+                        contextFinal.setOpenInProgress(false);
+                        contextFinal.setChannel(future.channel()).setOperation(request);
+                        pendingOps.addAll(group.pendingRequests);
+                        group.pendingRequests.clear();
+                    }
+
                     sendAfterConnect(future.channel(), contextFinal, request, group);
+
+                    // trigger pending operations
+                    for (Operation pendingOp : pendingOps) {
+                        pendingOp.setSocketContext(contextFinal);
+                        pendingOp.complete();
+                    }
+
                 } else {
                     returnOrClose(contextFinal, true);
                     fail(request, future.cause());
@@ -409,11 +522,17 @@ public class NettyChannelPool {
      */
     private void sendAfterConnect(Channel ch, NettyChannelContext contextFinal, Operation request,
             NettyChannelGroup group) {
-        if (this.isHttp2Only) {
-            contextFinal.setOpenInProgress(false);
+        if (request.getStatusCode() < Operation.STATUS_CODE_FAILURE_THRESHOLD) {
+            request.complete();
+        } else {
+            // The expiration tracking code runs in parallel with request connection and send. It uses two
+            // passes: it first sets the status code of an expired operation to timed out, then, on the next
+            // maintenance interval, calls fail. Calling fail twice on an operation is fine, but, we want to avoid
+            // calling complete, while an operation is marked timed out because the nestCompletion() call
+            // in connect() is not atomic: it can restore the original completion, which is the clients, and
+            // call the client completion directly.
+            request.fail(request.getStatusCode());
         }
-        contextFinal.setChannel(ch).setOperation(request);
-        request.complete();
     }
 
     private void fail(Operation request, Throwable e) {
@@ -421,20 +540,10 @@ public class NettyChannelPool {
     }
 
     public void returnOrClose(NettyChannelContext context, boolean isClose) {
-        ExecutorService e = this.executor;
-        if (e == null) {
-            return;
-        }
-        if (e.isShutdown()) {
-            return;
-        }
         if (context == null) {
             return;
         }
-
-        // execute in new thread, to avoid large call stacks when we process a
-        // lot of pending requests, due to failure
-        e.execute(() -> returnOrCloseDirect(context, isClose));
+        returnOrCloseDirect(context, isClose);
     }
 
     boolean isContextInUse(NettyChannelContext context) {
@@ -452,35 +561,37 @@ public class NettyChannelPool {
      */
     private void returnOrCloseDirect(NettyChannelContext context, boolean isClose) {
         Channel ch = context.getChannel();
-        isClose = isClose || !ch.isWritable() || !ch.isOpen();
+        // For HTTP/2, we'll be pumping lots of data on a connection, so it's
+        // okay if it's not writable: that's not an indication of a problem.
+        // For HTTP/1, we're doing serial requests. At this point in the code,
+        // if the connection isn't writable, it's an indication of a problem,
+        // so we'll close the connection.
+        if (this.isHttp2Only) {
+            isClose = isClose || !ch.isOpen() || !context.isValid();
+        } else {
+            isClose = isClose || !ch.isWritable() || !ch.isOpen();
+        }
         NettyChannelGroup group = this.channelGroups.get(context.getKey());
         if (group == null) {
+            LOGGER.warning("Cound not find group for " + context.getKey());
             context.close();
             return;
         }
 
-        if (this.isHttp2Only) {
-            returnOrCloseDirectHttp2(context, group, isClose);
-        } else {
-            returnOrCloseDirectHttp1(context, group, isClose);
-        }
+        returnOrCloseDirect(context, group, isClose);
     }
 
     /**
      * The implementation for returnOrCloseDirect when using HTTP/1.1
      */
-    private void returnOrCloseDirectHttp1(NettyChannelContext context, NettyChannelGroup group,
+    private void returnOrCloseDirect(NettyChannelContext context, NettyChannelGroup group,
             boolean isClose) {
         Operation pendingOp = null;
         synchronized (group) {
-            if (!group.pendingRequests.isEmpty()) {
-                pendingOp = group.pendingRequests
-                        .remove(group.pendingRequests.size() - 1);
-            }
-
+            pendingOp = group.pendingRequests.poll();
             if (isClose) {
                 group.inUseChannels.remove(context);
-            } else {
+            } else if (!this.isHttp2Only) {
                 if (pendingOp == null) {
                     group.availableChannels.add(context);
                     group.inUseChannels.remove(context);
@@ -497,47 +608,9 @@ public class NettyChannelPool {
         }
 
         if (isClose) {
-            connectOrReuse(context.host, context.port, pendingOp);
+            connectOrReuse(context.getKey(), pendingOp);
         } else {
             context.setOperation(pendingOp);
-            pendingOp.complete();
-        }
-    }
-
-    /**
-     * The implementation for returnOrCloseDirect when using HTTP/2
-     */
-    private void returnOrCloseDirectHttp2(NettyChannelContext context, NettyChannelGroup group,
-            boolean isClose) {
-
-        boolean havePending;
-        synchronized (group) {
-            if (isClose) {
-                context.setOpenInProgress(false);
-                group.http2Channels.remove(context);
-            }
-            havePending = !group.pendingRequests.isEmpty();
-        }
-
-        if (isClose) {
-            context.close();
-        }
-
-        if (!havePending) {
-            return;
-        }
-
-        Operation pendingOp = null;
-        if (isClose || !context.isValid()) {
-            synchronized (group) {
-                pendingOp = group.pendingRequests.remove(group.pendingRequests.size() - 1);
-            }
-            connectOrReuse(context.host, context.port, pendingOp);
-        } else {
-            synchronized (group) {
-                pendingOp = group.pendingRequests.remove(0);
-            }
-            pendingOp.setSocketContext(context);
             pendingOp.complete();
         }
     }
@@ -547,21 +620,19 @@ public class NettyChannelPool {
             for (NettyChannelGroup g : this.channelGroups.values()) {
                 synchronized (g) {
                     for (NettyChannelContext c : g.availableChannels) {
-                        c.close();
+                        c.close(true);
                     }
                     for (NettyChannelContext c : g.inUseChannels) {
-                        c.close();
-                    }
-                    for (NettyChannelContext c : g.http2Channels) {
-                        c.close();
+                        c.close(true);
                     }
                     g.availableChannels.clear();
                     g.inUseChannels.clear();
-                    g.http2Channels.clear();
                 }
             }
             this.eventGroup.shutdownGracefully();
-            this.nettyExecutorService.shutdown();
+            if (this.nettyExecutorService != null) {
+                this.nettyExecutorService.shutdown();
+            }
         } catch (Throwable e) {
             // ignore exception
         }
@@ -569,94 +640,52 @@ public class NettyChannelPool {
     }
 
     public void handleMaintenance(Operation op) {
+        long now = Utils.getNowMicrosUtc();
         if (this.isHttp2Only) {
-            handleHttp2Maintenance(op);
+            handleHttp2Maintenance(now);
         } else {
-            handleHttp1Maintenance(op);
+            handleHttp1Maintenance(now);
         }
         op.complete();
     }
 
-    private void handleHttp1Maintenance(Operation op) {
+    private void handleHttp1Maintenance(long now) {
         for (NettyChannelGroup g : this.channelGroups.values()) {
-            synchronized (g) {
-                closeContexts(g.availableChannels, false);
-                closeExpiredInUseContext(g.inUseChannels);
-            }
+            closeIdleChannelContexts(g, false, now);
         }
     }
 
-    private void handleHttp2Maintenance(Operation op) {
+    private void handleHttp2Maintenance(long now) {
         for (NettyChannelGroup g : this.channelGroups.values()) {
-            synchronized (g) {
-                expireHttp2Operations(g);
-                closeHttp2Context(g);
-            }
-        }
-    }
-
-    /**
-     * Scan HTTP/1.1 contexts and timeout any operations that need to be timed out.
-     */
-    private void closeExpiredInUseContext(Collection<NettyChannelContext> contexts) {
-        long now = Utils.getNowMicrosUtc();
-        for (NettyChannelContext c : contexts) {
-            Operation activeOp = c.getOperation();
-            if (activeOp == null || activeOp.getExpirationMicrosUtc() > now) {
-                continue;
-            }
-            this.executor.execute(() -> {
-                // client has nested completion on failure, and will close context
-                activeOp.fail(new TimeoutException(activeOp.toString()));
-            });
-            continue;
+            closeInvalidHttp2ChannelContexts(g, now);
         }
     }
 
     /**
      * Scan unused HTTP/1.1 contexts and close any that have been unused for CHANNEL_EXPIRATION_MICROS
      */
-    private void closeContexts(Collection<NettyChannelContext> contexts, boolean forceClose) {
-        long now = Utils.getNowMicrosUtc();
-        List<NettyChannelContext> items = new ArrayList<>();
-        for (NettyChannelContext c : contexts) {
-            try {
-                if (c.getChannel() == null || !c.getChannel().isOpen()) {
-                    continue;
+    private void closeIdleChannelContexts(NettyChannelGroup group,
+            boolean forceClose, long now) {
+        synchronized (group) {
+            Iterator<NettyChannelContext> it = group.availableChannels.iterator();
+            while (it.hasNext()) {
+                NettyChannelContext c = it.next();
+                if (!forceClose) {
+                    long delta = now - c.getLastUseTimeMicros();
+                    if (delta < CHANNEL_EXPIRATION_MICROS) {
+                        continue;
+                    }
+                    try {
+                        if (c.getChannel() == null || !c.getChannel().isOpen()) {
+                            continue;
+                        }
+                    } catch (Throwable e) {
+                    }
                 }
-            } catch (Throwable e) {
-            }
 
-            long delta = now - c.getLastUseTimeMicros();
-            if (!forceClose && delta < CHANNEL_EXPIRATION_MICROS) {
-                continue;
-            }
-            c.close();
-            items.add(c);
-        }
-        for (NettyChannelContext c : items) {
-            contexts.remove(c);
-        }
-    }
-
-    private void expireHttp2Operations(NettyChannelGroup group) {
-        long now = Utils.getNowMicrosUtc();
-        for (NettyChannelContext c : group.http2Channels) {
-
-            for (Iterator<Map.Entry<Integer, Operation>> it = c.streamIdMap.entrySet()
-                    .iterator(); it.hasNext();) {
-                Map.Entry<Integer, Operation> entry = it.next();
-
-                final Operation activeOp = entry.getValue();
-                if (activeOp == null || activeOp.getExpirationMicrosUtc() > now) {
-                    continue;
-                }
                 it.remove();
-                this.executor.execute(() -> {
-                    // client has nested completion on failure, and will close context
-                    activeOp.fail(new TimeoutException(activeOp.toString()));
-                });
-                continue;
+                LOGGER.info("Closing expired channel " + c.getKey());
+                c.close();
             }
         }
     }
@@ -666,32 +695,31 @@ public class NettyChannelPool {
      * the maximum number of streams that can be sent on the connection.
      * @param group
      */
-    private void closeHttp2Context(NettyChannelGroup group) {
-        long now = Utils.getNowMicrosUtc();
-        List<NettyChannelContext> items = new ArrayList<>();
-        for (NettyChannelContext http2Channel : group.http2Channels) {
+    private void closeInvalidHttp2ChannelContexts(NettyChannelGroup group, long now) {
+        synchronized (group) {
+            Iterator<NettyChannelContext> it = group.inUseChannels.iterator();
+            while (it.hasNext()) {
+                NettyChannelContext http2Channel = it.next();
+                // We close a channel for two reasons:
+                // First, if it hasn't been used for a while
+                // Second, if we've exhausted the number of streams
+                Channel channel = http2Channel.getChannel();
+                if (channel == null) {
+                    continue;
+                }
 
-            // We close a channel for two reasons:
-            // First, if it hasn't been used for a while
-            // Second, if we've exhausted the number of streams
-            Channel channel = http2Channel.getChannel();
-            if (channel == null || !channel.isOpen()) {
-                continue;
-            }
+                if (http2Channel.hasActiveStreams()) {
+                    continue;
+                }
 
-            if (http2Channel.haveStreamsInUse()) {
-                continue;
-            }
+                long delta = now - http2Channel.getLastUseTimeMicros();
+                if (delta < CHANNEL_EXPIRATION_MICROS && http2Channel.isValid()) {
+                    continue;
+                }
 
-            long delta = now - http2Channel.getLastUseTimeMicros();
-            if (delta < CHANNEL_EXPIRATION_MICROS && http2Channel.isValid()) {
-                continue;
+                it.remove();
+                http2Channel.close();
             }
-            channel.close();
-            items.add(http2Channel);
-        }
-        for (NettyChannelContext c : items) {
-            group.http2Channels.remove(c);
         }
     }
 

@@ -13,11 +13,15 @@
 
 package com.vmware.xenon.services.common;
 
+import static java.util.stream.Collectors.toList;
+
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 import org.junit.Before;
@@ -33,86 +37,149 @@ import com.vmware.xenon.common.ServiceDocumentQueryResult;
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.test.TestRequestSender;
+import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 
 public class TestExampleService extends BasicReusableHostTestCase {
 
     public int serviceCount = 100;
+    private URI factoryUri;
+    private final Long counterValue = Long.MAX_VALUE;
+    private final String prefix = "example-";
+    private TestRequestSender sender;
 
     @Before
     public void prepare() throws Throwable {
+
+        this.factoryUri = UriUtils.buildFactoryUri(this.host, ExampleService.class);
+
         // make sure example factory is started. the host does not wait for it
         // to start since its not a core service. Note that in production code
         // this is all asynchronous, you should not block and wait, just pass a
         // completion
-        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
+
+        // Starting example factory is already done in ExampleServiceHost for this test.
+        // Here is an example how to start factory service:
+        //    this.host.startFactory(ExampleService.class, ExampleService::createFactory);
+
+
+        // Next, wait the factory service to be available in the node group (for this test, only
+        // one node is in the node group).
+        // For multiple nodes in the node group, make sure all nodes have joined the node group
+        // and wait for the node group convergence using following methods:
+        //   this.host.joinNodesAndVerifyConvergence(...);
+        //   this.host.waitForNodeGroupConvergence(...);
+        this.host.waitForReplicatedFactoryServiceAvailable(this.factoryUri);
+
+        this.sender = new TestRequestSender(this.host);
     }
 
     @Test
     public void factoryPost() throws Throwable {
-        URI factoryUri = UriUtils.buildFactoryUri(this.host,
-                ExampleService.class);
-
-        this.host.testStart(this.serviceCount);
-        String prefix = "example-";
-        Long counterValue = Long.MAX_VALUE;
-        URI[] childURIs = new URI[this.serviceCount];
-        for (int i = 0; i < this.serviceCount; i++) {
-            ExampleServiceState initialState = new ExampleServiceState();
-            initialState.name = initialState.documentSelfLink = prefix + i;
-            initialState.counter = counterValue;
-            final int finalI = i;
-            // create an example service
-            Operation createPost = Operation
-                    .createPost(factoryUri)
-                    .setBody(initialState).setCompletion((o, e) -> {
-                        if (e != null) {
-                            this.host.failIteration(e);
-                            return;
-                        }
-                        ServiceDocument rsp = o.getBody(ServiceDocument.class);
-                        childURIs[finalI] = UriUtils.buildUri(this.host, rsp.documentSelfLink);
-                        this.host.completeIteration();
-                    });
-            this.host.send(createPost);
-        }
-        this.host.testWait();
+        List<ExampleServiceState> childStates = postExampleServicesThenGetStates("factory-post");
 
         // do GET on all child URIs
-        Map<URI, ExampleServiceState> childStates = this.host.getServiceState(null,
-                ExampleServiceState.class, childURIs);
-        for (ExampleServiceState s : childStates.values()) {
-            assertEquals(counterValue, s.counter);
-            assertTrue(s.name.startsWith(prefix));
+        for (ExampleServiceState s : childStates) {
+            assertEquals(this.counterValue, s.counter);
+            assertTrue(s.name.startsWith(this.prefix));
             assertEquals(this.host.getId(), s.documentOwner);
-            assertTrue(s.documentEpoch != null && s.documentEpoch == 0L);
+            assertEquals(3, s.keyValues.size());
+            assertEquals(Long.valueOf(0), s.documentEpoch);
         }
 
         // verify template GET works on factory
-        ServiceDocumentQueryResult templateResult = this.host.getServiceState(null,
-                ServiceDocumentQueryResult.class,
-                UriUtils.extendUri(factoryUri, ServiceHost.SERVICE_URI_SUFFIX_TEMPLATE));
+        URI uri = UriUtils.extendUri(this.factoryUri, ServiceHost.SERVICE_URI_SUFFIX_TEMPLATE);
+        ServiceDocumentQueryResult templateResult = this.sender.sendGetAndWait(uri.toString(),
+                ServiceDocumentQueryResult.class);
 
         assertTrue(templateResult.documentLinks.size() == templateResult.documents.size());
         ExampleServiceState childTemplate = Utils.fromJson(
                 templateResult.documents.get(templateResult.documentLinks.iterator().next()),
                 ExampleServiceState.class);
-        assertTrue(childTemplate.keyValues != null);
-        assertTrue(childTemplate.counter != null);
-        assertTrue(childTemplate.name != null);
-        assertTrue(childTemplate.documentDescription != null);
-        assertTrue(childTemplate.documentDescription.propertyDescriptions != null
-                && childTemplate.documentDescription.propertyDescriptions
-                        .size() > 0);
-        assertTrue(childTemplate.documentDescription.propertyDescriptions
-                .containsKey("name"));
-        assertTrue(childTemplate.documentDescription.propertyDescriptions
-                .containsKey("counter"));
+        assertNotNull(childTemplate.keyValues);
+        assertNotNull(childTemplate.counter);
+        assertNotNull(childTemplate.name);
+        assertNotNull(childTemplate.documentDescription);
+        assertNotNull(childTemplate.documentDescription.propertyDescriptions);
+        assertTrue(childTemplate.documentDescription.propertyDescriptions.size() > 0);
+        assertTrue(childTemplate.documentDescription.propertyDescriptions.containsKey("name"));
+        assertTrue(childTemplate.documentDescription.propertyDescriptions.containsKey("counter"));
 
         PropertyDescription pdMap = childTemplate.documentDescription.propertyDescriptions
                 .get(ExampleServiceState.FIELD_NAME_KEY_VALUES);
         assertTrue(pdMap.usageOptions.contains(PropertyUsageOption.OPTIONAL));
         assertTrue(pdMap.indexingOptions.contains(PropertyIndexingOption.EXPAND));
+    }
+
+    @Test
+    public void factoryPatchMap() throws Throwable {
+        //create example services
+        List<ExampleServiceState> childStates = postExampleServicesThenGetStates("patch-map");
+        List<String> childPaths = childStates.stream().map(state -> state.documentSelfLink).collect(toList());
+
+
+        //test that example services are created correctly
+        for (ExampleServiceState s : childStates) {
+            assertEquals(this.counterValue, s.counter);
+            assertTrue(s.name.startsWith(this.prefix));
+            assertEquals(this.host.getId(), s.documentOwner);
+            assertEquals(3, s.keyValues.size());
+            assertEquals("test-value-1", s.keyValues.get("test-key-1"));
+            assertEquals("test-value-2", s.keyValues.get("test-key-2"));
+            assertEquals("test-value-3", s.keyValues.get("test-key-3"));
+            assertEquals(Long.valueOf(0), s.documentEpoch);
+        }
+
+        //patch example services
+        List<Operation> patches = new ArrayList<>();
+        for (ExampleServiceState s : childStates) {
+            s.keyValues.put("test-key-1", "test-value-1-patch-1");
+            s.keyValues.put("test-key-2", "test-value-2-patch-1");
+            s.keyValues.put("test-key-3", "test-value-3-patch-1");
+            Operation createPatch = Operation
+                    .createPatch(UriUtils.buildUri(this.host, s.documentSelfLink))
+                    .setBody(s);
+            patches.add(createPatch);
+        }
+        this.sender.sendAndWait(patches);
+
+        //test that example services are patched correctly
+        List<ExampleServiceState> patchedStates = getExampleServiceStates(childPaths);
+        for (ExampleServiceState s : patchedStates) {
+            assertEquals(this.counterValue, s.counter);
+            assertTrue(s.name.startsWith(this.prefix));
+            assertEquals(this.host.getId(), s.documentOwner);
+            assertEquals(3, s.keyValues.size());
+            assertEquals("test-value-1-patch-1", s.keyValues.get("test-key-1"));
+            assertEquals("test-value-2-patch-1", s.keyValues.get("test-key-2"));
+            assertEquals("test-value-3-patch-1", s.keyValues.get("test-key-3"));
+            assertEquals(Long.valueOf(0), s.documentEpoch);
+        }
+
+        //patch example services when deleting some values in the keyValues map
+        List<Operation> patchesToSetNull = new ArrayList<>();
+        for (ExampleServiceState s : patchedStates) {
+            s.keyValues.put("test-key-1", "test-value-1-patch-1");
+            s.keyValues.put("test-key-2", null);
+            s.keyValues.put("test-key-3", null);
+            Operation createPatch = Operation
+                    .createPatch(UriUtils.buildUri(this.host, s.documentSelfLink))
+                    .setBody(s);
+            patchesToSetNull.add(createPatch);
+        }
+        this.sender.sendAndWait(patchesToSetNull);
+
+        //test that deleted values in the keyValues map are gone
+        List<ExampleServiceState> patchesToSetNullStates = getExampleServiceStates(childPaths);
+        for (ExampleServiceState s : patchesToSetNullStates) {
+            assertEquals(this.counterValue, s.counter);
+            assertTrue(s.name.startsWith(this.prefix));
+            assertEquals(this.host.getId(), s.documentOwner);
+            assertEquals(1, s.keyValues.size());
+            assertEquals("test-value-1-patch-1", s.keyValues.get("test-key-1"));
+            assertEquals(Long.valueOf(0), s.documentEpoch);
+        }
     }
 
     @Test
@@ -123,38 +190,47 @@ public class TestExampleService extends BasicReusableHostTestCase {
         // completion
         this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
 
-        URI factoryUri = UriUtils.buildFactoryUri(this.host,
-                ExampleService.class);
-        this.host.testStart(1);
-        URI[] childURI = new URI[1];
         ExampleServiceState initialState = new ExampleServiceState();
         initialState.name = UUID.randomUUID().toString();
         initialState.counter = Long.MAX_VALUE;
 
         // create an example service
-        Operation createPost = Operation
-                .createPost(factoryUri)
-                .setBody(initialState).setCompletion((o, e) -> {
-                    if (e != null) {
-                        this.host.failIteration(e);
-                        return;
-                    }
-                    ServiceDocument rsp = o.getBody(ServiceDocument.class);
-                    childURI[0] = UriUtils.buildUri(this.host, rsp.documentSelfLink);
-                    this.host.completeIteration();
-                });
-        this.host.send(createPost);
+        Operation createPost = Operation.createPost(this.factoryUri).setBody(initialState);
+        ServiceDocument rsp = this.sender.sendAndWait(createPost, ServiceDocument.class);
+        URI childURI = UriUtils.buildUri(this.host, rsp.documentSelfLink);
 
-        this.host.testWait();
 
         host.toggleNegativeTestMode(true);
         // issue a PUT that we expect it to fail.
         ExampleServiceState emptyBody = new ExampleServiceState();
-        host.testStart(1);
-        Operation put = Operation.createPut(childURI[0])
-                .setCompletion(host.getExpectedFailureCompletion()).setBody(emptyBody);
-        host.send(put);
-        host.testWait();
+        Operation put = Operation.createPut(childURI).setBody(emptyBody);
+
+        FailureResponse failureResponse = this.sender.sendAndWaitFailure(put);
+        assertEquals("name must be set", failureResponse.failure.getMessage());
+
         host.toggleNegativeTestMode(false);
+    }
+
+    private List<ExampleServiceState> postExampleServicesThenGetStates(String suffix) {
+        List<Operation> ops = new ArrayList<>();
+        for (int i = 0; i < this.serviceCount; i++) {
+            ExampleServiceState initialState = new ExampleServiceState();
+            initialState.name = initialState.documentSelfLink = this.prefix + i + suffix;
+            initialState.counter = this.counterValue;
+            initialState.keyValues.put("test-key-1", "test-value-1");
+            initialState.keyValues.put("test-key-2", "test-value-2");
+            initialState.keyValues.put("test-key-3", "test-value-3");
+            // create an example service
+            Operation createPost = Operation.createPost(this.factoryUri).setBody(initialState);
+            ops.add(createPost);
+        }
+        return this.sender.sendAndWait(ops, ExampleServiceState.class);
+    }
+
+    private List<ExampleServiceState> getExampleServiceStates(List<String> servicePaths) {
+        List<Operation> ops = servicePaths.stream()
+                .map(path -> Operation.createGet(this.host, path))
+                .collect(toList());
+        return this.sender.sendAndWait(ops, ExampleServiceState.class);
     }
 }

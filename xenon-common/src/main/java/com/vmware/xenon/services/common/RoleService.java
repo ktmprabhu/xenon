@@ -15,13 +15,38 @@ package com.vmware.xenon.services.common;
 
 import java.util.Set;
 
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.common.Utils;
 
 public class RoleService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_ROLES;
+
+    public static Service createFactory() {
+        FactoryService fs = new FactoryService(RoleState.class) {
+
+            @Override
+            public Service createServiceInstance() throws Throwable {
+                return new RoleService();
+            }
+
+            @Override
+            public void handlePost(Operation request) {
+                RoleState roleState = AuthorizationCacheUtils.extractBody(request, this, RoleState.class);
+                if (roleState != null) {
+                    AuthorizationCacheUtils.clearAuthzCacheForRole(this, request, roleState);
+                }
+                super.handlePost(request);
+            }
+        };
+        fs.toggleOption(ServiceOption.IDEMPOTENT_POST, true);
+        return fs;
+    }
+
     public enum Policy {
         ALLOW,
         DENY,
@@ -51,6 +76,15 @@ public class RoleService extends StatefulService {
     }
 
     @Override
+    public void handleRequest(Operation request, OperationProcessingStage opProcessingStage) {
+        RoleState roleState = AuthorizationCacheUtils.extractBody(request, this, RoleState.class);
+        if (roleState != null) {
+            AuthorizationCacheUtils.clearAuthzCacheForRole(this, request, roleState);
+        }
+        super.handleRequest(request, opProcessingStage);
+    }
+
+    @Override
     public void handleStart(Operation op) {
         if (!op.hasBody()) {
             op.fail(new IllegalArgumentException("body is required"));
@@ -61,7 +95,6 @@ public class RoleService extends StatefulService {
         if (!validate(op, state)) {
             return;
         }
-
         op.complete();
     }
 
@@ -78,13 +111,12 @@ public class RoleService extends StatefulService {
         }
 
         RoleState currentState = getState(op);
-        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
             op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
         } else {
             setState(op, newState);
         }
-
         op.complete();
     }
 

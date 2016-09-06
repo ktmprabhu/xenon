@@ -27,10 +27,14 @@ import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.logging.Level;
 
+import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats;
 import com.vmware.xenon.common.ServiceSubscriptionState.ServiceSubscriber;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.UiContentService;
+
 
 /**
  * Utility service managing the various URI control REST APIs for each service instance. A single
@@ -41,6 +45,7 @@ public class UtilityService implements Service {
     private transient Service parent;
     private ServiceStats stats;
     private ServiceSubscriptionState subscriptions;
+    private UiContentService uiService;
 
     public UtilityService() {
     }
@@ -201,13 +206,20 @@ public class UtilityService implements Service {
         op.complete();
     }
 
+    public boolean hasSubscribers() {
+        ServiceSubscriptionState subscriptions = this.subscriptions;
+        return subscriptions != null
+                && subscriptions.subscribers != null
+                && !subscriptions.subscribers.isEmpty();
+    }
+
     public void notifySubscribers(Operation op) {
         try {
-            if (this.subscriptions == null || this.subscriptions.subscribers == null) {
+            if (op.getAction() == Action.GET) {
                 return;
             }
 
-            if (op.getAction() == Action.GET) {
+            if (!this.hasSubscribers()) {
                 return;
             }
 
@@ -327,89 +339,34 @@ public class UtilityService implements Service {
             String defaultHtmlPath = UriUtils.buildUriPath(servicePath.substring(0,
                     servicePath.length() - ServiceUriPaths.UI_PATH_SUFFIX.length()),
                     ServiceUriPaths.UI_SERVICE_HOME);
-            try {
-                redirectGetToHtmlUiResource(op, defaultHtmlPath);
-            } catch (UnsupportedEncodingException e) {
-                op.fail(e);
-            }
+
+            redirectGetToHtmlUiResource(op, defaultHtmlPath);
             return;
         }
 
-        // The entry point to the UI resource rendering is a HTML file named the same as the service
-        // class.
-        // E.g com.vmware.ExampleService -> com/vmware/ExampleService/index.html
-        String serviceUiResourcePath;
-        if (this.parent.getDocumentTemplate().documentDescription != null &&
-                this.parent.getDocumentTemplate().documentDescription.userInterfaceResourcePath
-                    != null) {
-            serviceUiResourcePath = Utils.buildCustomUiResourceUriPrefixPath(this.parent);
-        } else {
-            serviceUiResourcePath = Utils.buildUiResourceUriPrefixPath(this.parent);
+        if (this.uiService == null) {
+            this.uiService = new UiContentService() {
+            };
+            this.uiService.setHost(this.parent.getHost());
         }
 
-        // find what's after the selfLink
-        String uriPath = op.getUri().getPath();
-        String selfLink = this.parent.getSelfLink();
-        uriPath = uriPath.substring(selfLink.length() + ServiceHost.SERVICE_URI_SUFFIX_UI.length());
-
-        if (uriPath.equals("")) {
-            try {
-                // redirect to /service/ui/ (trailing slash!)
-                redirectGetToTrailingSlash(op, selfLink + ServiceHost.SERVICE_URI_SUFFIX_UI);
-                return;
-            } catch (UnsupportedEncodingException e) {
-                op.fail(e);
-                return;
-            }
-        } else if (uriPath.equals(UriUtils.URI_PATH_CHAR)) {
-            // serve index.html on /service/ui/
-            serviceUiResourcePath += UriUtils.URI_PATH_CHAR + ServiceUriPaths.UI_RESOURCE_DEFAULT_FILE;
-        } else {
-            // forward to /service/ui/some-resource.js
-            serviceUiResourcePath += uriPath;
-        }
-
-        proxyGetToCustomHtmlUiResource(op, serviceUiResourcePath);
+        // simulate a full service deployed at the utility endpoint /service/ui
+        String selfLink = this.parent.getSelfLink() + ServiceHost.SERVICE_URI_SUFFIX_UI;
+        this.uiService.handleUiGet(selfLink, this.parent, op);
     }
 
-    public void redirectGetToHtmlUiResource(Operation op, String htmlResourcePath)
-            throws UnsupportedEncodingException {
+    public void redirectGetToHtmlUiResource(Operation op, String htmlResourcePath) {
         // redirect using relative url without host:port
         // not so much optimization as handling the case of port forwarding/containers
-        op.addResponseHeader(Operation.LOCATION_HEADER,
-                URLDecoder.decode(htmlResourcePath, Utils.CHARSET));
+        try {
+            op.addResponseHeader(Operation.LOCATION_HEADER,
+                    URLDecoder.decode(htmlResourcePath, Utils.CHARSET));
+        } catch (UnsupportedEncodingException e) {
+            throw new IllegalStateException(e);
+        }
+
         op.setStatusCode(Operation.STATUS_CODE_MOVED_TEMP);
-        op.setContentType(Operation.MEDIA_TYPE_TEXT_HTML);
         op.complete();
-    }
-
-    /**
-     * 302 redirect to the provided folderPath with a '/' appended
-     * @param op
-     * @param folderPath
-     * @throws UnsupportedEncodingException
-     */
-    private void redirectGetToTrailingSlash(Operation op, String folderPath)
-            throws UnsupportedEncodingException {
-        op.addResponseHeader(Operation.LOCATION_HEADER,
-                URLDecoder.decode(folderPath + UriUtils.URI_PATH_CHAR, Utils.CHARSET));
-        op.setStatusCode(Operation.STATUS_CODE_MOVED_TEMP);
-        op.setContentType(Operation.MEDIA_TYPE_TEXT_HTML);
-        op.complete();
-    }
-
-    public void proxyGetToCustomHtmlUiResource(Operation op, String htmlResourcePath) {
-        Operation get = op.clone();
-        get.setUri(UriUtils.buildUri(getHost(), htmlResourcePath))
-                .setReferer(op.getReferer())
-                .setCompletion((o, e) -> {
-                    op.setBody(o.getBodyRaw())
-                            .setContentType(o.getContentType())
-                            .complete();
-                });
-
-        getHost().sendRequest(get);
-        return;
     }
 
     private void handleStatsRequest(Operation op) {
@@ -452,7 +409,7 @@ public class UtilityService implements Service {
                 op.fail(new IllegalArgumentException("stat does not exist"));
                 return;
             }
-            setStat(existingStat, newStat.latestValue);
+            initializeOrSetStat(existingStat, newStat);
             op.complete();
             break;
         case DELETE:
@@ -563,9 +520,23 @@ public class UtilityService implements Service {
         op.complete();
     }
 
+    private void initializeOrSetStat(ServiceStat stat, ServiceStat newValue) {
+        synchronized (stat) {
+            if (stat.timeSeriesStats == null && newValue.timeSeriesStats != null) {
+                stat.timeSeriesStats = new TimeSeriesStats(newValue.timeSeriesStats.numBins,
+                        newValue.timeSeriesStats.binDurationMillis, newValue.timeSeriesStats.aggregationType);
+            }
+            stat.unit = newValue.unit;
+            stat.sourceTimeMicrosUtc = newValue.sourceTimeMicrosUtc;
+            setStat(stat, newValue.latestValue);
+        }
+    }
+
     @Override
     public void setStat(ServiceStat stat, double newValue) {
         allocateStats();
+        findStat(stat.name, true, stat);
+
         synchronized (stat) {
             stat.version++;
             stat.accumulatedValue += newValue;
@@ -579,8 +550,15 @@ public class UtilityService implements Service {
                     stat.logHistogram.bins[binIndex]++;
                 }
             }
+            stat.lastUpdateMicrosUtc = Utils.getNowMicrosUtc();
+            if (stat.timeSeriesStats != null) {
+                if (stat.sourceTimeMicrosUtc != null) {
+                    stat.timeSeriesStats.add(stat.sourceTimeMicrosUtc, newValue);
+                } else {
+                    stat.timeSeriesStats.add(stat.lastUpdateMicrosUtc, newValue);
+                }
+            }
         }
-        stat.lastUpdateMicrosUtc = Utils.getNowMicrosUtc();
     }
 
     @Override
@@ -599,8 +577,15 @@ public class UtilityService implements Service {
                     stat.logHistogram.bins[binIndex]++;
                 }
             }
+            stat.lastUpdateMicrosUtc = Utils.getNowMicrosUtc();
+            if (stat.timeSeriesStats != null) {
+                if (stat.sourceTimeMicrosUtc != null) {
+                    stat.timeSeriesStats.add(stat.sourceTimeMicrosUtc, stat.latestValue);
+                } else {
+                    stat.timeSeriesStats.add(stat.lastUpdateMicrosUtc, stat.latestValue);
+                }
+            }
         }
-        stat.lastUpdateMicrosUtc = Utils.getNowMicrosUtc();
     }
 
     @Override
@@ -612,7 +597,7 @@ public class UtilityService implements Service {
         if (!allocateStats(true)) {
             return null;
         }
-        return findStat(name, create);
+        return findStat(name, create, null);
     }
 
     private void replaceSingleStat(ServiceStat stat) {
@@ -623,7 +608,7 @@ public class UtilityService implements Service {
             // create a new stat with the default values
             ServiceStat newStat = new ServiceStat();
             newStat.name = stat.name;
-            setStat(newStat, stat.latestValue);
+            initializeOrSetStat(newStat, stat);
             if (this.stats.entries == null) {
                 this.stats.entries = new HashMap<>();
             }
@@ -646,14 +631,14 @@ public class UtilityService implements Service {
         }
     }
 
-    private ServiceStat findStat(String name, boolean create) {
+    private ServiceStat findStat(String name, boolean create, ServiceStat initialStat) {
         synchronized (this.stats) {
             if (this.stats.entries == null) {
                 this.stats.entries = new HashMap<>();
             }
             ServiceStat st = this.stats.entries.get(name);
             if (st == null && create) {
-                st = new ServiceStat();
+                st = initialStat != null ? initialStat : new ServiceStat();
                 st.name = name;
                 this.stats.entries.put(name, st);
             }
@@ -815,5 +800,15 @@ public class UtilityService implements Service {
     @Override
     public Class<? extends ServiceDocument> getStateType() {
         return null;
+    }
+
+    @Override
+    public final void setAuthorizationContext(Operation op, AuthorizationContext ctx) {
+        throw new RuntimeException("Service not allowed to set authorization context");
+    }
+
+    @Override
+    public final AuthorizationContext getSystemAuthorizationContext() {
+        throw new RuntimeException("Service not allowed to get system authorization context");
     }
 }

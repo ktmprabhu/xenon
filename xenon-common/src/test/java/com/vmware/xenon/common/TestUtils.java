@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2015 VMware, Inc. All Rights Reserved.
+ * Copyright (c) 2014-2016 VMware, Inc. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy of
@@ -14,10 +14,11 @@
 package com.vmware.xenon.common;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.net.URLEncoder;
@@ -27,7 +28,6 @@ import java.nio.file.Paths;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
-import java.util.Arrays;
 import java.util.Calendar;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -40,43 +40,39 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
+import java.util.zip.GZIPOutputStream;
 
+import com.esotericsoftware.kryo.Kryo;
+import com.esotericsoftware.kryo.Kryo.DefaultInstantiatorStrategy;
+import com.esotericsoftware.kryo.serializers.VersionFieldSerializer;
 import com.google.gson.reflect.TypeToken;
 
 import org.junit.Assert;
 import org.junit.Test;
+import org.objenesis.strategy.StdInstantiatorStrategy;
 
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.Builder;
-import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
-import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
 import com.vmware.xenon.common.SystemHostInfo.OsFamily;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.QueryValidationTestService.QueryValidationServiceState;
-import com.vmware.xenon.services.common.ServiceUriPaths;
-
 
 public class TestUtils {
 
     public int iterationCount = 1000;
 
-    public static final Integer SOME_INT_VALUE = 100;
-    public static final Integer SOME_OTHER_INT_VALUE = 200;
-    public static final String SOME_STRING_VALUE = "some value";
-    public static final String SOME_OTHER_STRING_VALUE = "some other value";
-    public static final String SOME_IGNORE_VALUE = "ignore me";
-    public static final String SOME_OTHER_IGNORE_VALUE = "ignore me please";
-
-    private static class Range {
-        public final int from;
-        public final int to;
-
-        public Range(int from, int to) {
-            this.from = from;
-            this.to = to;
-        }
+    @Test
+    public void registerKind() {
+        String kindBefore = Utils.buildKind(ExampleServiceState.class);
+        String newKind = "e";
+        Utils.registerKind(ExampleServiceState.class, newKind);
+        String kindAfter = Utils.buildKind(ExampleServiceState.class);
+        assertEquals(newKind, kindAfter);
+        Utils.registerKind(ExampleServiceState.class, kindBefore);
+        kindAfter = Utils.buildKind(ExampleServiceState.class);
+        assertEquals(kindBefore, kindAfter);
     }
 
     @Test
@@ -127,6 +123,130 @@ public class TestUtils {
                 String.format(
                         "Binary serializations per second: %f, iterations: %d, byte count: %d",
                         thpt, count, byteCount));
+    }
+
+    @Test
+    public void setAndGetTimeComparisonEpsilon() {
+        long l = Utils.getTimeComparisonEpsilonMicros();
+        assertTrue(l > TimeUnit.SECONDS.toMicros(1));
+        l = 41;
+        // implicitly set epsilon through JVM property
+        System.setProperty(Utils.PROPERTY_NAME_PREFIX +
+                Utils.PROPERTY_NAME_TIME_COMPARISON, "" + l);
+        Utils.resetTimeComparisonEpsilonMicros();
+        long k = Utils.getTimeComparisonEpsilonMicros();
+        assertEquals(k, l);
+        // explicitly set epsilon
+        l = 45;
+        Utils.setTimeComparisonEpsilonMicros(l);
+        k = Utils.getTimeComparisonEpsilonMicros();
+        assertEquals(k, l);
+    }
+
+    @Test
+    public void isWithinTimeComparisonEpsilon() {
+        Utils.setTimeComparisonEpsilonMicros(TimeUnit.SECONDS.toMicros(10));
+        // check a value within about a millisecond from now
+        long l = Utils.getNowMicrosUtc() + 1000;
+        assertTrue(Utils.isWithinTimeComparisonEpsilon(l));
+        // check a value days from now
+        l = Utils.getNowMicrosUtc() + TimeUnit.DAYS.toMicros(2);
+        assertFalse(Utils.isWithinTimeComparisonEpsilon(l));
+    }
+
+    public static class CustomKryoForObjectThreadLocal extends ThreadLocal<Kryo> {
+        @Override
+        protected Kryo initialValue() {
+            return createKryo(true);
+        }
+    }
+
+    public static class CustomKryoForDocumentThreadLocal extends ThreadLocal<Kryo> {
+        @Override
+        protected Kryo initialValue() {
+            return createKryo(false);
+        }
+    }
+
+    private static final int EXAMPLE_SERVICE_CLASS_ID = 1234;
+
+    private static Kryo createKryo(boolean isObjectSerializer) {
+        Kryo k = new Kryo();
+        // handle classes with missing default constructors
+        k.setInstantiatorStrategy(new DefaultInstantiatorStrategy(new StdInstantiatorStrategy()));
+        // supports addition of fields if the @since annotation is used
+        k.setDefaultSerializer(VersionFieldSerializer.class);
+
+        if (!isObjectSerializer) {
+            // For performance reasons, and to avoid memory use, assume documents do not
+            // require object graph serialization with duplicate or recursive references
+            k.setReferences(false);
+        } else {
+            // To avoid monotonic increase of memory use, due to reference tracking, we must
+            // reset after each use.
+            k.setAutoReset(true);
+        }
+
+        k.register(ExampleServiceState.class, EXAMPLE_SERVICE_CLASS_ID);
+        HashMap<String, String> map = new HashMap<>();
+        k.register(map.getClass());
+        return k;
+    }
+
+    @Test
+    public void registerCustomKryoSerializer() {
+        try {
+
+            ExampleServiceState st = new ExampleServiceState();
+            st.id = UUID.randomUUID().toString();
+            st.counter = Utils.getNowMicrosUtc();
+            st.documentSelfLink = st.id;
+            st.keyValues = new HashMap<>();
+            st.keyValues.put(st.id, st.id);
+            // we need to prove that the default serializer, for both object and document is
+            // used and produces a different result, compared to the custom serializer. we first
+            // serialize with defaults, then with custom, and compare sizes
+
+            int byteCountToObjectDefault = Utils.toBytes(st, Utils.getBuffer(1024), 0);
+            int byteCountToDocumentImplicitDefault = Utils.toDocumentBytes((Object) st,
+                    Utils.getBuffer(1024), 0);
+            int byteCountToDocumentDefault = Utils.toDocumentBytes((Object) st,
+                    Utils.getBuffer(1024), 0);
+
+            Utils.registerCustomKryoSerializer(new CustomKryoForObjectThreadLocal(), false);
+            Utils.registerCustomKryoSerializer(new CustomKryoForDocumentThreadLocal(),
+                    true);
+
+            byte[] objectData = new byte[1024];
+            byte[] documentImplicitData = new byte[1024];
+            byte[] documentData = new byte[1024];
+            int byteCountToObjectCustom = Utils.toBytes((Object) st, objectData, 0);
+            int byteCountToDocumentImplicitCustom = Utils.toDocumentBytes((Object) st,
+                    documentImplicitData, 0);
+            int byteCountToDocumentCustom = Utils.toDocumentBytes((Object) st,
+                    documentData, 0);
+
+            assertTrue(byteCountToObjectCustom != byteCountToObjectDefault);
+            assertTrue(byteCountToDocumentImplicitCustom != byteCountToDocumentImplicitDefault);
+            assertTrue(byteCountToDocumentDefault != byteCountToDocumentCustom);
+
+            ExampleServiceState stDeserializedFromObject = (ExampleServiceState) Utils.fromBytes(
+                    objectData);
+            ExampleServiceState stDeserializedImplicit = (ExampleServiceState) Utils
+                    .fromDocumentBytes(
+                            documentImplicitData, 0, byteCountToDocumentImplicitCustom);
+            ExampleServiceState stDeserialized = (ExampleServiceState) Utils.fromDocumentBytes(
+                    documentData, 0, byteCountToDocumentCustom);
+            assertEquals(st.id, stDeserializedFromObject.id);
+            assertEquals(st.id, stDeserializedImplicit.id);
+            assertEquals(st.id, stDeserialized.id);
+            assertEquals(st.id, stDeserializedFromObject.keyValues.get(st.id));
+            assertEquals(st.id, stDeserializedImplicit.keyValues.get(st.id));
+            assertEquals(st.id, stDeserialized.keyValues.get(st.id));
+        } finally {
+            Utils.registerCustomKryoSerializer(null, false);
+            Utils.registerCustomKryoSerializer(null, true);
+        }
     }
 
     @Test
@@ -280,7 +400,7 @@ public class TestUtils {
         assertTrue(false == ServiceDocument.equals(desc, original, changed));
 
         changed = Utils.clone(original);
-        changed.stringValue = UUID.randomUUID().toString();
+        changed.textValue = UUID.randomUUID().toString();
         assertTrue(false == ServiceDocument.equals(desc, original, changed));
 
         changed = Utils.clone(original);
@@ -305,7 +425,7 @@ public class TestUtils {
 
     public void logThroughput(int count, boolean useBinary, ServiceDocumentDescription desc,
             ServiceDocument original)
-                    throws Throwable {
+            throws Throwable {
 
         long s = Utils.getNowMicrosUtc();
         long length = 0;
@@ -336,7 +456,7 @@ public class TestUtils {
 
     public QueryValidationServiceState serializedAndCompareDocuments(
             boolean useBinary, QueryValidationServiceState original)
-                    throws Throwable {
+            throws Throwable {
         QueryValidationServiceState originalDeserializedWithSig = null;
         if (useBinary) {
             byte[] serializedDocument = new byte[4096];
@@ -445,6 +565,24 @@ public class TestUtils {
                 TimeUnit.NANOSECONDS.toMillis(stop - start)));
     }
 
+    private static class TestKeyObjectValueHolder {
+        private final Map<String, Object> keyValues = new HashMap<>();
+    }
+
+    private void checkOptions(EnumSet<Service.ServiceOption> options) {
+        checkOptions(options, false);
+    }
+
+    private void checkOptions(EnumSet<Service.ServiceOption> options, boolean isFailureExpected) {
+        String error;
+        for (Service.ServiceOption o : options) {
+            error = Utils.validateServiceOption(options, o);
+            if (error != null && !isFailureExpected) {
+                throw new IllegalArgumentException(error);
+            }
+        }
+    }
+
     @Test
     public void validateServiceOption() {
         // positive tests
@@ -484,6 +622,12 @@ public class TestUtils {
 
         options = EnumSet.of(ServiceOption.OWNER_SELECTION);
         checkOptions(options, true);
+
+        options = EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE, ServiceOption.ON_DEMAND_LOAD);
+        checkOptions(options, true);
+
+        options = EnumSet.of(ServiceOption.ON_DEMAND_LOAD, ServiceOption.PERSISTENCE);
+        checkOptions(options, false);
     }
 
     @Test
@@ -635,329 +779,12 @@ public class TestUtils {
         assertTrue(val3.containsKey("key32"));
     }
 
-    /**
-     * Test merging where patch updates all mergeable fields.
-     */
     @Test
-    public void testFullMerge() {
-        MergeTest source = new MergeTest();
-        source.s = SOME_STRING_VALUE;
-        source.x = SOME_INT_VALUE;
-        source.ignore = SOME_IGNORE_VALUE;
-        MergeTest patch = new MergeTest();
-        patch.s = SOME_OTHER_STRING_VALUE;
-        patch.x = SOME_OTHER_INT_VALUE;
-        patch.ignore = SOME_OTHER_IGNORE_VALUE;
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertTrue("There should be changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_OTHER_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_OTHER_INT_VALUE);
-        Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
-    }
-
-    /**
-     * Test merging where patch updates all mergeable fields into an object which have all the fields unset.
-     */
-    @Test
-    public void testFullMerge2() {
-        MergeTest source = new MergeTest();
-        MergeTest patch = new MergeTest();
-        patch.s = SOME_OTHER_STRING_VALUE;
-        patch.x = SOME_OTHER_INT_VALUE;
-        patch.ignore = SOME_OTHER_IGNORE_VALUE;
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertTrue("There should be changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_OTHER_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_OTHER_INT_VALUE);
-        Assert.assertNull("Non-annotated ignore field", source.ignore);
-    }
-
-    @Test
-    public void testSerializeClassesWithoutDefaultConstructor() {
-        Range range = new Range(0, 100);
-        // clone uses kryo serialization
-        Range clone = Utils.clone(range);
-        assertEquals(range.from, clone.from);
-        assertEquals(range.to, clone.to);
-    }
-
-    /**
-     * Test merging partially defined patch object.
-     */
-    @Test
-    public void testPartialMerge() {
-        MergeTest source = new MergeTest();
-        source.s = SOME_STRING_VALUE;
-        source.x = SOME_INT_VALUE;
-        source.ignore = SOME_IGNORE_VALUE;
-        MergeTest patch = new MergeTest();
-        patch.x = SOME_OTHER_INT_VALUE;
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertTrue("There should be changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_OTHER_INT_VALUE);
-        Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
-    }
-
-    /**
-     * Test merging in an empty patch.
-     */
-    @Test
-    public void testEmptyMerge() {
-        MergeTest source = new MergeTest();
-        source.s = SOME_STRING_VALUE;
-        source.x = SOME_INT_VALUE;
-        source.ignore = SOME_IGNORE_VALUE;
-        MergeTest patch = new MergeTest();
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertFalse("There should be no changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_INT_VALUE);
-        Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
-    }
-
-    /**
-     * Test merging patch with same values as existing value.
-     */
-    @Test
-    public void testEqualsMerge() {
-        MergeTest source = new MergeTest();
-        source.s = SOME_STRING_VALUE;
-        source.x = SOME_INT_VALUE;
-        source.ignore = SOME_IGNORE_VALUE;
-        MergeTest patch = new MergeTest();
-        patch.s = source.s;
-        patch.x = source.x;
-        patch.ignore = SOME_OTHER_IGNORE_VALUE;
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertFalse("There should be no changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_INT_VALUE);
-        Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
-    }
-
-    @Test
-    public void testComputeSignatureChanged() {
-        ServiceDocumentDescription description = ServiceDocumentDescription.Builder.create()
-                .buildDescription(QueryValidationServiceState.class);
-
-        QueryValidationServiceState document = new QueryValidationServiceState();
-        document.documentSelfLink = "testComputeSignatureChange";
-        document.stringValue = "valueA";
-        document.documentExpirationTimeMicros = 1;
-        String initialSignature = Utils.computeSignature(document, description);
-
-        document.stringValue = "valueB";
-        String valueChangedSignature = Utils.computeSignature(document, description);
-
-        assertNotEquals(initialSignature, valueChangedSignature);
-
-        document.documentExpirationTimeMicros = 2;
-        String expirationChangedSignature = Utils.computeSignature(document, description);
-
-        assertNotEquals(initialSignature, expirationChangedSignature);
-        assertNotEquals(valueChangedSignature, expirationChangedSignature);
-    }
-
-    @Test
-    public void testComputeSignatureUnchanged() {
-        ServiceDocumentDescription description = ServiceDocumentDescription.Builder.create()
-                .buildDescription(QueryValidationServiceState.class);
-
-        QueryValidationServiceState document = new QueryValidationServiceState();
-        document.documentSelfLink = "testComputeSignatureChange";
-        document.stringValue = "valueA";
-        document.documentUpdateTimeMicros = 1;
-        String initialSignature = Utils.computeSignature(document, description);
-
-        document.documentUpdateTimeMicros = 2;
-        String updateChangedSignature = Utils.computeSignature(document, description);
-
-        assertEquals(initialSignature, updateChangedSignature);
-    }
-
-    /**
-     * Test service document.
-     */
-    private static class MergeTest extends ServiceDocument {
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
-        public Integer x;
-        @UsageOption(option = PropertyUsageOption.INFRASTRUCTURE)
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
-        public String s;
-        public String ignore;
-    }
-
-
-    @ServiceDocument.IndexingParameters(serializedStateSize = 8, versionRetention = 44)
-    private static class AnnotatedDoc extends ServiceDocument {
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
-        @PropertyOptions(indexing = PropertyIndexingOption.STORE_ONLY)
-        @Documentation(description = "desc", exampleString = "example")
-        public String opt;
-
-        @UsageOption(option = PropertyUsageOption.ID)
-        @PropertyOptions(
-                indexing = {
-                    PropertyIndexingOption.SORT,
-                    PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE},
-                usage = {
-                    PropertyUsageOption.OPTIONAL})
-        public String opts;
-
-    }
-
-    private static class TestKeyObjectValueHolder {
-        private final Map<String, Object> keyValues = new HashMap<>();
-    }
-
-    private void checkOptions(EnumSet<ServiceOption> options) {
-        checkOptions(options, false);
-    }
-
-    private void checkOptions(EnumSet<ServiceOption> options, boolean isFailureExpected) {
-        String error;
-        for (ServiceOption o : options) {
-            error = Utils.validateServiceOption(options, o);
-            if (error != null && !isFailureExpected) {
-                throw new IllegalArgumentException(error);
-            }
-        }
-    }
-
-    @Test
-    public void testMergeQueryResultsWithSameData() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testAnnotationOnFields() {
-        Builder builder = ServiceDocumentDescription.Builder.create();
-        ServiceDocumentDescription desc = builder.buildDescription(AnnotatedDoc.class);
-        assertEquals(8, desc.serializedStateSizeLimit);
-        assertEquals(44, desc.versionRetentionLimit);
-
-        PropertyDescription optDesc = desc.propertyDescriptions.get("opt");
-        assertEquals(optDesc.usageOptions, EnumSet.of(PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL));
-        assertEquals(optDesc.indexingOptions, EnumSet.of(PropertyIndexingOption.STORE_ONLY));
-        assertEquals(optDesc.exampleValue, "example");
-        assertEquals(optDesc.propertyDocumentation, "desc");
-
-        PropertyDescription optsDesc = desc.propertyDescriptions.get("opts");
-        assertEquals(optsDesc.usageOptions, EnumSet.of(PropertyUsageOption.ID, PropertyUsageOption.OPTIONAL));
-        assertEquals(optsDesc.indexingOptions, EnumSet.of(PropertyIndexingOption.SORT, PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE));
-    }
-
-    @Test
-    public void testMergeQueryResultsWithDifferentData() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 3, 4, 5, 7, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 10, 2, 3, 4, 5, 6, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 8 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testMergeQueryResultsWithEmptySet() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 3, 4, 5, 7, 8, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 10, 2, 3, 4, 5, 6, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {});
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testMergeQueryResultsWithAllEmpty() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(new int[] {});
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(new int[] {});
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {});
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] {}));
-    }
-
-    @Test
-    public void testMergeQueryResultsInDescOrder() {
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 9, 7, 5, 4, 3, 1 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 9, 6, 5, 4, 3, 2, 10 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 8, 4, 3, 2, 10, 1 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, false);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 9, 8, 7, 6, 5, 4, 3, 2, 10, 1 }));
-    }
-
-    private ServiceDocumentQueryResult createServiceDocumentQueryResult(int[] documentIndices) {
-
-        ServiceDocumentQueryResult result = new ServiceDocumentQueryResult();
-        result.documentCount = (long) documentIndices.length;
-        result.documents = new HashMap<>();
-
-        for (int index : documentIndices) {
-            String documentLink = ServiceUriPaths.CORE_LOCAL_QUERY_TASKS + "/document" + index;
-            result.documentLinks.add(documentLink);
-            result.documents.put(documentLink, new Object());
-        }
-
-        return result;
-    }
-
-    private boolean verifyMergeResult(ServiceDocumentQueryResult mergeResult,
-            int[] expectedSequence) {
-        if (mergeResult.documentCount != expectedSequence.length) {
-            return false;
-        }
-
-        for (int i = 0; i < expectedSequence.length; i++) {
-            String expectedLink = ServiceUriPaths.CORE_LOCAL_QUERY_TASKS + "/document"
-                    + expectedSequence[i];
-            if (!expectedLink.equals(mergeResult.documentLinks.get(i))) {
-                return false;
-            }
-        }
-
-        return true;
+    public void testHash() {
+        String string1 = "foofoo";
+        String string2 = "barbar";
+        Assert.assertEquals(Utils.computeHash(string1), Utils.computeHash(string1));
+        Assert.assertNotEquals(Utils.computeHash(string1), Utils.computeHash(string2));
     }
 
     @Test
@@ -970,5 +797,86 @@ public class TestUtils {
                 Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED);
 
         Assert.assertEquals(textPlain, textDecoded);
+    }
+
+    @Test
+    public void testValidateStateForUniqueIdentifier() {
+        ExampleServiceState state = new ExampleServiceState();
+        state.id = null;
+        state.required = "testRequiredField";
+        ServiceDocumentDescription desc = buildStateDescription(ExampleServiceState.class, null);
+        Utils.validateState(desc, state);
+        Assert.assertNotNull("Unique Identifier was not provided a default UUID", state.id);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testValidateStateForRequiredField() {
+        ExampleServiceState state = new ExampleServiceState();
+        state.id = null;
+        state.required = null;
+        ServiceDocumentDescription desc = buildStateDescription(ExampleServiceState.class, null);
+        Utils.validateState(desc, state);
+    }
+
+    @Test
+    public void testDecodeGzipedResponseBody() throws Exception {
+        String body = "This is the original body content, but gzipped";
+        byte[] gzippedBody = compress(body);
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(gzippedBody.length)
+                .addResponseHeader(Operation.CONTENT_ENCODING_HEADER,
+                        Operation.CONTENT_ENCODING_GZIP)
+                .addResponseHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        Utils.decodeBody(op, ByteBuffer.wrap(gzippedBody));
+
+        assertEquals(body, op.getBody(String.class));
+
+        // Content encoding header is removed as the body is already decoded
+        assertNull(op.getResponseHeader(Operation.CONTENT_ENCODING_HEADER));
+    }
+
+    @Test
+    public void testDecodeGzipedRequestBody() throws Exception {
+        String body = "This is the original body content, but gzipped";
+        byte[] gzippedBody = compress(body);
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(gzippedBody.length)
+                .addRequestHeader(Operation.CONTENT_ENCODING_HEADER,
+                        Operation.CONTENT_ENCODING_GZIP)
+                .addRequestHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        Utils.decodeBody(op, ByteBuffer.wrap(gzippedBody));
+
+        assertEquals(body, op.getBody(String.class));
+
+        // Content encoding header is removed as the body is already decoded
+        assertNull(op.getRequestHeader(Operation.CONTENT_ENCODING_HEADER));
+    }
+
+    @Test
+    public void testFailsDecodeGzipedBodyWithoutContentEncoding() throws Exception {
+        byte[] gzippedBody = compress("test");
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(gzippedBody.length)
+                .addResponseHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        Utils.decodeBody(op, ByteBuffer.wrap(gzippedBody));
+
+        assertEquals(Operation.STATUS_CODE_SERVER_FAILURE_THRESHOLD, op.getStatusCode());
+    }
+
+    private static byte[] compress(String str) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        GZIPOutputStream gzip = new GZIPOutputStream(out);
+        gzip.write(str.getBytes(Utils.CHARSET));
+        gzip.close();
+        return out.toByteArray();
     }
 }

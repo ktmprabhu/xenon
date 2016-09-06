@@ -1,6 +1,347 @@
 # CHANGELOG
 
-## 0.7.2-SNAPSHOT
+## 0.9.5-SNAPSHOT
+
+* Change ServiceDocumentQueryResult.selectedDocuments from Map<String,String> to
+  Map<String,Object> making it the same as the Map<String,Object> documents field.
+  This avoid ugly escaping of the document content which was already JSON
+
+* Add support for case insensitive queries. New PropertyIndexingOption.CASE_INSENSITIVE
+  instructs the index service to index the field in lower case. The original field
+  content is preserved in original case. At query time, the field match value
+  must be converted to lower case. New helper methods added to hide the toLower()
+  conversion when using the Query.Builder().
+
+* Add a new sendWithDeferredResult pair of methods to the request senders
+  The new sendWithDeferredResult set of methods return DeferredResult
+  instances to enable monadic style of chaining potentially asynchronous
+  code blocks. Check the refactored SamplePreviousEchoService and
+  SampleBootstrapService for usage examples.
+  The implementation of DeferredResult encapsulates CompletableFuture with
+  similar interface, excluding the blocking methods.
+
+## 0.9.4
+
+* QueryOption.INCLUDE_ALL_VERSIONS now includes deleted versions,
+  no longer requiring INCLUDE_DELETED to be also set. So it actually
+  trully returns *all* versions
+
+* Add support for per thread user defined kryo serializers. See method
+  Utils#registerCustomKryoSerializers
+
+* Improve QueryFilters to support numeric document properties
+
+* Add TestRequestSender to provide synchronous API for writing unit tests.
+  This class is recommended for sending operations instead of sendXxx() method
+  variants in VerificationHost. All synchronous methods return response operation
+  or body document which eliminates the use of TestContext in test code.
+  Please reference the TestExampleService for usage.
+
+* Add stat for tracking number of times maintenance was ran for the ServiceHost.
+
+## 0.9.3
+
+* Add a flavor of mergeWithState() that processes a
+  ServiceStateCollectionUpdateRequest object to add and remove
+  elements from a collection
+
+* Add Operation#appendCompletion method. This method adds completion handler
+  in FIFO style. This is symmetric to nestCompletion which adds completion
+  handler in LIFO. See the javadoc for details.
+
+* Add time series stats for thread count, CPU, memory, disk in the
+  existing stats tracked by /core/management/stats
+
+* Add support for new GraphQueryOption.FILTER_STAGE_RESULTS. The option
+  enables automatic filtering of results across query stages, only keeping
+  documents that contributed to results in the final stage. It essentially
+  walks the graph backwards and removes all edges and nodes that did not
+  lead to a graph node in the final stage
+
+* Support ODATA custom query options to specify tenantLinks. The
+  query param will be used to populate the tenantLinks field of
+  the underlying QueryTask
+
+* Rename TimeSeriesStats DataPoint data structure to TimeBin
+
+* Add support for groupBy queries. The new QueryOption.GROUP_BY, in
+  combination with the QuerySpecification.groupByTerm, groupSortTem
+  and groupSortOrder, allow for grouping, by field values of document
+  results. The new ServiceDocumentQueryResult.nextPageLinksByGroup
+  map contains links to the per group results, returning a QueryTask,
+  similar to existing query pages, scoped to results for that group
+
+* Improve MigrationTaskService's transformation contract to use a
+  TransformRequest for the transform's input and a TransformResponse as the
+  ouput (instead of serializing a Collection directly). Existing transform's
+  work as before, but new contract should be preferred moving forward by
+  specifying MigrationOption.USE_TRANSFORM_REQUEST.
+
+## 0.9.2
+
+* Using sourceTimeMicrosUtc field, if set, for time series aggregation.
+
+## 0.9.1
+
+* Add a new field *sourceTimeMicrosUtc* to ServiceStat to capture the
+  time the data value was acquired at the source.
+
+## 0.9.0
+
+* Add sample code for Bootstrap Service Tutorial.
+  https://github.com/vmware/xenon/wiki/Bootstrap-Service-Tutorial
+
+* Move VerificationHost#findUnixProcessInfoByXxx,killUnixProcess to SystemUtils class.
+  Referenced class(ProcessInfo) has moved to SystemUtils class as well.
+
+* Clear the authz cache maintained in ServiceHost on all nodes in a multi-node
+  deployment.
+
+* Add support for graph queries. The new GraphQueryTaskService, listening on
+  /core/graph-queries enables multi stage queries that can traverse linked
+  documents. Each stage uses the QueryTask specification, to select the documents
+  that serve as the graph nodes. The graph edges, that link nodes together are
+  specified through link fields, and the of QueryOption.SELECT_LINKS, which is
+  automatically enabled to return the set of document links that form the nodes
+  for the next stage of the graph. Like regular query tasks, both direct, and
+  asynchronous REST pattern models are supported on the task service instance.
+  The following is an example of a two stage graph query
+  Stage 0: Filter documents by kind eq ParentState. SelectLinks: childLink,nephewLink
+  Stage 1: Filter documents by kind eq ChildState AND field name = Jimmy
+  Since each stage is a full query, the results can be sorted, paginated, use
+  complex boolean, nested expression trees, etc. They can even use broadcast
+  for 3x replication scenarios.
+  The graph queries are load balanced across nodes.
+
+* Modify new QueryOption.SELECT_LINKS and QueryOption.EXPAND_LINKS behavior
+  to properly de-duplicate expanded state for selected links and make the
+  selection results similar to the existing documentLinks and documents,
+  in usage and behavior.
+  The selectedLinks map is now called selectedLinksPerDocument.
+
+## 0.8.2
+
+* Add global stats for total service pauses, resumes, cache clears
+  and ON_DEMAND_LOAD service stops on /core/management service.
+
+* Move a few infrastructure query related helper methods from Utils class
+  to QueryTaskUtils. The mergeQueryResults family of methods are used by
+  core services, so this should have minimal impact
+
+* Add PropertyUsageOption.REQUIRED to describe fields that are required.
+
+* Add validateState(description, state) to Utils to validate fields that
+  are required. If the field is null, REQUIRED and ID, a UUID is automatically
+  generated. If the field is null and REQUIRED, an Exception is thrown.
+
+* Add QueryOption.EXPAND_LINKS for expanding selected link values with the
+  target document state and including it in the query results. The serialized
+  state, is placed in the results.selectedLinks map.
+
+* Add PropertyUsageOption.SENSITIVE to describe fields that contain sensitive
+  information. When marked, the field will be hidden when serializing to JSON
+  using toJson(boolean hideSensitiveFields, boolean useHtmlFormatting).
+
+* Add support for configurable auth expiration via JVM property or login request to
+  BasicAuthenticationService.
+
+* Use SEND_WITH_CALLBACK in NettyHttpServiceClient if the request was
+  configured for connectionSharing and SSL
+
+* Add QueryOption.SELECT_LINKS for selecting fields marked with
+  PropertyUsageOption.LINK and including the link values in the query results.
+  The link selection will be used for future graph query support and
+  automatic link content expansion.
+
+* Add transaction flow support, across related operations, similar to
+  authorization context and context id flow support
+
+* Rename LuceneQueryTaskFactoryService and LuceneQueryTaskService to
+  QueryTaskFactoryService and QueryTaskService. Similar change for
+  local query task service. Service code should use
+      ServiceUriPaths.CORE_QUERY_TASKS
+      ServiceUriPaths.CORE_LOCAL_QUERY_TASKS
+  instead of the service SELF_LINK fields.
+
+* Upgrade Netty from 4.1.0.CR7 to 4.1.0.Final
+
+* Add new JVM properties in ServiceClient and ServiceRequestListener interfaces
+  for maximum request and response payload size limits.
+
+* Remove ServiceClient.sendWithCallback and ServiceHost.sendRequestWithCallback.
+  Functionality is available through OperationOption.SEND_WITH_CALLBACK,
+  symmetric to HTTP/2 functionality that is toggled through CONNECTION_SHARING
+
+* Add new static fields that map to JVM properties that enable selection of
+  HTTP scheme, for replication and forwarding, in NodeSelectorService interface.
+
+* Invalidate authz cache in ServiceHost when any authz service(UserGroupService,
+  RoleService or ResourceGroupService) is created, modified or deleted
+
+* Add Operation.toggleOption and Operation.hasOption to allow direct manipulation
+  of operation options and reduce code in Operation class methods
+
+* Add support for OData to filter by all searchable fields of a document.
+  Using "ALL_FIELDS" as a property name in a typical OData filter, e.g.
+  /documents?$filter=ALL_FIELDS eq foo, will unfold the search to all indexed
+  fields of document and their sub-fields nested up to 2 levels, excluding the
+  build-in ServiceDocument fields.
+
+* Introduce PropertyIndexingOption.FIXED_ITEM_NAME. This option directs the
+  document indexing service to ensure the indexing property name will be a fixed
+  value, matching that of the field itself. Applicable for fields of type MAP,
+  it will allow to make queries based on the name of the field to search for
+  keys and values of a map.
+
+## 0.8.1
+
+* Add support for expiration on stateful in-memory services. We now
+  support expiration and auto-DELETE on services with
+  ServiceOption.PERSISTED and without
+
+* Add Operation.disableFailureLogging to allow control on default
+  failure logging behavior. Disable logging of failures on on demand
+  load services, if the demand load action is a DELETE
+
+* Add OData query parameter $orderbytype used for specifying the type
+  of property specified through $orderby parameter. This allows the
+  OData query service in Xenon to support sorting for both numeric
+  and string types.
+
+* Add Utils.registerKind(Class<?>, String) allowing for custom mapping
+  of service document types to kind strings. The default is derived
+  from the canonical name of the class, as before. This is not a breaking
+  change.
+
+* Enable binary payload serialization during replication, using the same KRYO
+  serialization we currently use for storing state in the index. The
+  binary payload is only used during replication to peers so this is
+  an internal optimization, not visible to clients or service authors.
+  HTTP + JSON is still the default mechanism for all I/O between
+  services and clients to xenon hosts. This is not a breaking change.
+
+* Add StatefulService.getStateDescription() convenience method
+  which also reduces allocations when a service author needs
+  the reflect state document description
+
+* Upgrade Lucene from 5.3.1 to 6.0.0
+
+* Use Murmur3 hash, instead of SHA1 for ServiceDocument.equals
+  and document signature calculation
+
+* Add support for binary serialization of operation body, using
+  KRYO binary serializer (same as what currently used for storing
+  state in the index). The client opts in by setting the operation
+  content type to the new Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM
+
+* Remove experimental PRAGMA_VALUE_HTTP2, it is now expressed
+  through OperationOption.CONNECTION_SHARING.
+
+* Add support for starting ServiceHost only with HTTPS.
+  To disable HTTP listener, provide "--port=-1" to the startup parameters.
+
+* Add support for connection tags, optimize HTTP/2 I/O path. Connection
+  tags allow finer control of connection pools, connection limit. HTTP/2
+  default connection tag uses (by default) 4 parallel HTTP/2 connections
+  per host, with potentially millions of pending operations in each.
+  Perf gain of 2x on HTTP/2, with these changes.
+
+* Enable HTTP2 for forwarding (as part of built in owner selection and loadbalancing)
+
+## 0.8.0
+
+* Enhance QueryOption.BROADCAST to use documents from owner nodes
+  For details please see: https://www.pivotaltracker.com/projects/1471320/stories/116412415
+
+* Upgrade netty from 4.1.0.CR3 to 4.1.0.CR7
+
+* Update JWT(Json Web Token) to use private key when SSL is enabled. Otherwise,
+  default value(same across all nodes) is used. (NOT SECURE)
+  JWT is used to sign/verify authorization context token.
+
+  In multi node environment, it is required to use same certificate and private
+  key within same node group.
+  If different cert is used, communication between nodes will fail since different
+  private key is used to sign/verify json.
+  We are planning certificate rotation in future.
+
+  NOTE:
+    Using the default token is insecure and should not be done in production
+    settings when authorization is enabled.
+
+* Add additional "Operation#setOperationCompletion" that allows the caller
+  to supply two discrete callbacks: one for successful completion, and
+  one for failure.
+  For completion that does not share code between the two paths, this
+  should be the preferred alternative.
+
+* Use HTTP/2 for replication and forwarding requests
+
+* Add logging methods that take lambda expression to construct
+  log message. The lambda is evaluated lazily.
+
+* Remove PRAGMA_DIRECTIVE_NO_QUEUING and make no-queuing
+  the default behavior. That means finding a service succeeds
+  if the service exists or fails-fast in the case it doesn't.
+  Use PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY to
+  override the default.
+
+## 0.7.6
+
+* Improve index searcher management in lucene document index
+  service. Track index searchers for paginated query tasks
+  using a sorted tree map, and close them when their query
+  task expiration is reached. This avoid query failures
+  under load, for paginated tasks.
+
+* Add replication request header that allows the replication
+  level to be set per operation. Useful for scenarios that
+  require all peer nodes to see an update, independent of the
+  membership quorum associated with the node group. For example
+  all authorization related updates should replicate to all
+  peers, before the operation completes
+
+* Switch consistent hashing algorithm used by the default
+  node selector, to Murmur3 32bit, instead of SHA1. Much less
+  memory use, faster, leaner. This is an implementation detail,
+  not visible to consumers to xenon.
+
+* Add ServiceHost.checkFactoryAvailable and
+  NodeGroupUtils.checkServiceAvailability convenience methods
+  that use broadcast GET requests to all peers, to the service
+  /available suffix, and return success if at least one peer
+  reports status OK. This is useful for tests and production
+  code that wants to determine if factory synchronization is
+  complete, either on initial node start or after node changes
+
+* Add MigrationTaskService, a task that can synchronize state
+  between two node groups, for a given factory. Used as part
+  of the "blue/green" live upgrade procedure. See wiki for
+  multi node live upgrade details
+
+* Add userGroupLinks as a field in UserService
+
+* Remove TypeName.ARRAY and use TypeName.COLLECTION instead
+
+## 0.7.5
+
+* New TaskService.java base class to reduce duplicate code when
+  implementing a task service. Subclasses no longer need to
+  override: handleStart(), sendSelfPatch(), updateSelf(). Also
+  provides common validation and default task expiration.
+
+* New FactoryService.create helpers and ServiceHost.startFactory
+  and startService helpers that reduce duplicate code
+
+* New Operation.createXXXX(ServiceHost h, link) helpers
+  to eliminate need for UriUtils.buildUri
+
+* Option to serve a Swagger 2.0 API description of a ServiceHost
+
+* Add a UiContentService that behaves like a regular web-server serving
+  static files from a folder. It simplifies custom UI hosting.
+
+## 0.7.2
 
 * Simplify service synchronization logic during node group
   changes. Eliminate support for complex divergence scenarios

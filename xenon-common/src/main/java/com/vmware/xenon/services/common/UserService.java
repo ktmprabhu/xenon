@@ -13,17 +13,32 @@
 
 package com.vmware.xenon.services.common;
 
+import java.util.EnumSet;
+import java.util.Set;
+
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.ServiceDocumentDescription;
+import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
 import com.vmware.xenon.common.StatefulService;
 
 public class UserService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_USERS;
+
+    public static Service createFactory() {
+        return FactoryService.createIdempotent(UserService.class);
+    }
+
     /**
      * The {@link UserState} represents a single user's identity.
      */
     public static class UserState extends ServiceDocument {
         public static final String FIELD_NAME_EMAIL = "email";
+        public static final String FIELD_NAME_USER_GROUP_LINKS = "userGroupLinks";
         public String email;
+        public Set<String> userGroupLinks;
     }
 
     public UserService() {
@@ -31,6 +46,24 @@ public class UserService extends StatefulService {
         super.toggleOption(ServiceOption.PERSISTENCE, true);
         super.toggleOption(ServiceOption.REPLICATION, true);
         super.toggleOption(ServiceOption.OWNER_SELECTION, true);
+    }
+
+    @Override
+    public void handleRequest(Operation request, OperationProcessingStage opProcessingStage) {
+        if (request.getAction() == Action.DELETE || request.getAction() == Action.PUT ||
+                request.getAction() == Action.PATCH) {
+            UserState userState;
+            if (request.isFromReplication() && request.hasBody()) {
+                userState = getBody(request);
+            } else {
+                userState = getState(request);
+            }
+            if (userState != null) {
+                AuthorizationCacheUtils
+                        .clearAuthzCacheForUser(this, request, userState.documentSelfLink);
+            }
+        }
+        super.handleRequest(request, opProcessingStage);
     }
 
     @Override
@@ -44,7 +77,6 @@ public class UserService extends StatefulService {
         if (!validate(op, state)) {
             return;
         }
-
         op.complete();
     }
 
@@ -61,12 +93,39 @@ public class UserService extends StatefulService {
         }
 
         UserState currentState = getState(op);
-        if (currentState.email.equals(newState.email)) {
+        // if the email field has not changed and the userGroupsLinks field is either null
+        // or the same in both the current state and the state passed in return a 304
+        // response
+        if (currentState.email.equals(newState.email)
+                && ((currentState.userGroupLinks == null && newState.userGroupLinks == null)
+                || (currentState.userGroupLinks != null && newState.userGroupLinks != null
+                    && currentState.userGroupLinks.equals(newState.userGroupLinks)))) {
             op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
         } else {
             setState(op, newState);
         }
+        op.complete();
+    }
 
+    @Override
+    public void handlePatch(Operation op) {
+        if (!op.hasBody()) {
+            op.fail(new IllegalArgumentException("body is required"));
+            return;
+        }
+        UserState currentState = getState(op);
+        UserState newState = op.getBody(UserState.class);
+        if (newState.email != null) {
+            currentState.email = newState.email;
+        }
+        if (newState.userGroupLinks != null) {
+            if (currentState.userGroupLinks == null) {
+                currentState.userGroupLinks = newState.userGroupLinks;
+            } else {
+                currentState.userGroupLinks.addAll(newState.userGroupLinks);
+            }
+        }
+        op.setBody(currentState);
         op.complete();
     }
 
@@ -87,5 +146,19 @@ public class UserService extends StatefulService {
         }
 
         return true;
+    }
+
+    @Override
+    public ServiceDocument getDocumentTemplate() {
+        ServiceDocument td = super.getDocumentTemplate();
+        ServiceDocumentDescription.PropertyDescription pdGroupLinks = td.documentDescription.propertyDescriptions
+                .get(UserState.FIELD_NAME_USER_GROUP_LINKS);
+        if (pdGroupLinks == null) {
+            throw new IllegalStateException(UserState.FIELD_NAME_USER_GROUP_LINKS
+                    + " property is missing in the service document");
+        }
+        pdGroupLinks.indexingOptions = EnumSet
+                .of(PropertyIndexingOption.EXPAND);
+        return td;
     }
 }

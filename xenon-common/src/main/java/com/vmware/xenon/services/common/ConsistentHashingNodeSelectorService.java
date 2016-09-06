@@ -13,10 +13,7 @@
 
 package com.vmware.xenon.services.common;
 
-import java.io.UnsupportedEncodingException;
-import java.math.BigInteger;
 import java.net.URI;
-import java.security.MessageDigest;
 import java.util.Collection;
 import java.util.SortedMap;
 import java.util.TreeMap;
@@ -27,18 +24,21 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
+import com.vmware.xenon.common.MurmurHash3;
 import com.vmware.xenon.common.NodeSelectorService;
 import com.vmware.xenon.common.NodeSelectorService.SelectAndForwardRequest.ForwardingOption;
 import com.vmware.xenon.common.NodeSelectorState;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service;
+import com.vmware.xenon.common.ServiceClient;
 import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.StatelessService;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
+import com.vmware.xenon.services.common.NodeGroupService.UpdateQuorumRequest;
 
 /**
  * Uses consistent hashing to assign a client specified key to one
@@ -47,7 +47,7 @@ import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
 public class ConsistentHashingNodeSelectorService extends StatelessService implements
         NodeSelectorService {
 
-    private ConcurrentSkipListMap<String, byte[]> hashedNodeIds = new ConcurrentSkipListMap<>();
+    private ConcurrentSkipListMap<String, Long> hashedNodeIds = new ConcurrentSkipListMap<>();
     private ConcurrentLinkedQueue<SelectAndForwardRequest> pendingRequests = new ConcurrentLinkedQueue<>();
 
     // Cached node group state. Refreshed during maintenance
@@ -79,6 +79,14 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         } else {
             state = start.getBody(NodeSelectorState.class);
         }
+
+        getHost().getClient().setConnectionLimitPerTag(
+                ServiceClient.CONNECTION_TAG_REPLICATION,
+                NodeSelectorService.REPLICATION_TAG_CONNECTION_LIMIT);
+
+        getHost().getClient().setConnectionLimitPerTag(
+                ServiceClient.CONNECTION_TAG_FORWARDING,
+                FORWARDING_TAG_CONNECTION_LIMIT);
 
         state.documentSelfLink = getSelfLink();
         state.documentKind = Utils.buildKind(NodeSelectorState.class);
@@ -112,7 +120,8 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         sendRequest(Operation.createGet(this, this.cachedState.nodeGroupLink).setCompletion(
                 (o, e) -> {
                     if (e == null) {
-                        this.cachedGroupState = o.getBody(NodeGroupState.class);
+                        NodeGroupState ngs = o.getBody(NodeGroupState.class);
+                        updateCachedNodeGroupState(ngs, null);
                     } else {
                         logSevere(e);
                     }
@@ -133,30 +142,37 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
     private Consumer<Operation> handleNodeGroupNotification() {
         return (notifyOp) -> {
             notifyOp.complete();
-            if (notifyOp.getAction() != Action.PATCH) {
+
+            NodeGroupState ngs = null;
+            if (notifyOp.getAction() == Action.PATCH) {
+                UpdateQuorumRequest bd = notifyOp.getBody(UpdateQuorumRequest.class);
+                if (UpdateQuorumRequest.KIND.equals(bd.kind)) {
+                    updateCachedNodeGroupState(null, bd);
+                    return;
+                }
+            } else if (notifyOp.getAction() != Action.POST) {
                 return;
             }
 
-            NodeGroupState ngs = notifyOp.getBody(NodeGroupState.class);
+            ngs = notifyOp.getBody(NodeGroupState.class);
             if (ngs.nodes == null || ngs.nodes.isEmpty()) {
                 return;
             }
-
-            NodeGroupState previous = this.cachedGroupState;
-            this.cachedGroupState = ngs;
-            if (previous == null) {
-                return;
-            }
-            NodeState pSelf = previous.nodes.get(getHost().getId());
-            NodeState nSelf = ngs.nodes.get(getHost().getId());
-            if (nSelf.membershipQuorum != pSelf.membershipQuorum) {
-                logInfo("Quorum changed, before: %d, after:%d", pSelf.membershipQuorum,
-                        nSelf.membershipQuorum);
-            }
-
-            this.isNodeGroupConverged = false;
-            this.isSynchronizationRequired = true;
+            updateCachedNodeGroupState(ngs, null);
         };
+    }
+
+    @Override
+    public void authorizeRequest(Operation op) {
+        if (op.getAction() != Action.POST && op.getAction() != Action.GET) {
+            super.authorizeRequest(op);
+            return;
+        }
+
+        // Authorize selection requests, they have no side effects other than CPU usage (and
+        // back pressure can be used to throttle them). Forwarding requests will have
+        // authorization applied on them as part of their target service processing
+        op.complete();
     }
 
     @Override
@@ -197,7 +213,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
      *  If selectors become indexed services, this will need to be removed and the
      *  service host should do a asynchronous query or GET to retrieve the selector state. Since this
      *  is not an API a service author can call (they have no access to this instance), the change will
-     *  be transparent to DCP users.
+     *  be transparent to runtime users.
      */
     public String getNodeGroup() {
         return this.cachedState.nodeGroupLink;
@@ -207,7 +223,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
      *  Infrastructure use only
      */
     public void selectAndForward(Operation op, SelectAndForwardRequest body) {
-        selectAndForward(body, op, this.cachedGroupState, null);
+        selectAndForward(body, op, this.cachedGroupState);
     }
 
     /**
@@ -215,8 +231,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
      * node. Both the key and the nodes are hashed
      */
     private void selectAndForward(SelectAndForwardRequest body, Operation op,
-            NodeGroupState localState,
-            MessageDigest digest) {
+            NodeGroupState localState) {
 
         String keyValue = body.key != null ? body.key : body.targetPath;
         SelectOwnerResponse response = new SelectOwnerResponse();
@@ -238,16 +253,8 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             return;
         }
 
-        int quorum = localState.nodes.get(getHost().getId()).membershipQuorum;
-        int availableNodes = localState.nodes.size();
-        SortedMap<BigInteger, NodeState> closestNodes =
-                selectNodes(op, keyValue, localState, digest, quorum, availableNodes);
-
-        NodeState closest = closestNodes.get(closestNodes.firstKey());
-        response.ownerNodeId = closest.id;
-        response.isLocalHostOwner = response.ownerNodeId.equals(getHost().getId());
-        response.ownerNodeReference = UriUtils.buildUri(closest.groupReference, "");
-        response.selectedNodes = closestNodes.values();
+        // select nodes and update response
+        selectNodes(op, response, localState);
 
         if (body.targetPath == null) {
             op.setBodyNoCloning(response).complete();
@@ -256,6 +263,9 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
 
         if (body.options != null && body.options.contains(ForwardingOption.BROADCAST)) {
             if (body.options.contains(ForwardingOption.REPLICATE)) {
+                if (op.getAction() == Action.DELETE) {
+                    response.selectedNodes = localState.nodes.values();
+                }
                 replicateRequest(op, body, response);
             } else {
                 broadcast(op, body, response);
@@ -264,70 +274,68 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         }
 
         // If targetPath != null, we need to forward the operation.
-        URI remoteService = UriUtils.buildUri(response.ownerNodeReference.getScheme(),
-                response.ownerNodeReference.getHost(),
-                response.ownerNodeReference.getPort(),
+        URI remoteService = UriUtils.buildUri(response.ownerNodeGroupReference.getScheme(),
+                response.ownerNodeGroupReference.getHost(),
+                response.ownerNodeGroupReference.getPort(),
                 body.targetPath, body.targetQuery);
 
-        Operation fwdOp = op.clone().setCompletion(
-                (o, e) -> {
-                    op.transferResponseHeadersFrom(o).setStatusCode(o.getStatusCode())
-                            .setBodyNoCloning(o.getBodyRaw());
-                    if (e != null) {
-                        op.fail(e);
-                        return;
-                    }
-                    op.complete();
-                });
+        Operation fwdOp = op.clone()
+                .setCompletion(
+                        (o, e) -> {
+                            op.transferResponseHeadersFrom(o).setStatusCode(o.getStatusCode())
+                                    .setBodyNoCloning(o.getBodyRaw());
+                            if (e != null) {
+                                op.fail(e);
+                                return;
+                            }
+                            op.complete();
+                        });
         getHost().getClient().send(fwdOp.setUri(remoteService));
     }
 
-    private SortedMap<BigInteger, NodeState> selectNodes(Operation op, String keyValue,
-            NodeGroupState localState, MessageDigest digest, int quorum,
-            int availableNodes) {
-        SortedMap<BigInteger, NodeState> closestNodes = new TreeMap<>();
-        int maxQuorum = 0;
+    private void selectNodes(Operation op,
+            SelectOwnerResponse response,
+            NodeGroupState localState) {
+        NodeState self = localState.nodes.get(getHost().getId());
+        int quorum = this.cachedState.membershipQuorum;
+        int availableNodes = localState.nodes.size();
+
+        if (availableNodes == 1) {
+            response.ownerNodeId = self.id;
+            response.isLocalHostOwner = true;
+            response.ownerNodeGroupReference = self.groupReference;
+            response.selectedNodes = localState.nodes.values();
+            return;
+        }
+
+        SortedMap<Long, NodeState> closestNodes = new TreeMap<>();
         long neighbourCount = 1;
         if (this.cachedState.replicationFactor != null) {
             neighbourCount = this.cachedState.replicationFactor;
         }
 
-        if (digest == null) {
-            digest = Utils.createDigest();
-        }
+        final int seed = 0;
+        int keyHash = MurmurHash3.murmurhash3_x86_32(
+                response.key, 0, response.key.length(), seed);
 
-        byte[] key;
-        try {
-            key = digest.digest(keyValue.getBytes(Utils.CHARSET));
-        } catch (UnsupportedEncodingException e) {
-            op.fail(e);
-            return null;
-        }
-
-        BigInteger keyInteger = new BigInteger(key);
         for (NodeState m : localState.nodes.values()) {
             if (NodeState.isUnAvailable(m)) {
                 availableNodes--;
                 continue;
             }
 
-            quorum = Math.max(m.membershipQuorum, quorum);
-            maxQuorum = Math.max(quorum, maxQuorum);
-            byte[] hashedNodeId;
-            try {
-                hashedNodeId = this.hashedNodeIds.get(m.id);
-                if (hashedNodeId == null) {
-                    digest.reset();
-                    hashedNodeId = digest.digest(m.id.getBytes(Utils.CHARSET));
-                    this.hashedNodeIds.put(m.id, hashedNodeId);
-                }
-            } catch (UnsupportedEncodingException e) {
-                op.fail(e);
-                return closestNodes;
+            response.availableNodeCount++;
+            int nodeIdHash = 0;
+            Long nodeIdHashLong = this.hashedNodeIds.get(m.id);
+            if (nodeIdHashLong == null) {
+                nodeIdHash = MurmurHash3.murmurhash3_x86_32(m.id, 0, m.id.length(), seed);
+                this.hashedNodeIds.put(m.id, (long) nodeIdHash);
+            } else {
+                nodeIdHash = nodeIdHashLong.intValue();
             }
-            BigInteger nodeIdInteger = new BigInteger(hashedNodeId);
-            BigInteger distance = nodeIdInteger.subtract(keyInteger);
-            distance = distance.multiply(distance);
+
+            long distance = nodeIdHash - keyHash;
+            distance *= distance;
             closestNodes.put(distance, m);
             if (closestNodes.size() > neighbourCount) {
                 // keep sorted map with only the N closest neighbors to the key
@@ -335,18 +343,18 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             }
         }
 
-        if (maxQuorum != quorum) {
-            logWarning("Self quorum: %d, max quorum: %d. Using max", quorum, maxQuorum);
-            quorum = maxQuorum;
-        }
-
         if (availableNodes < quorum) {
             op.fail(new IllegalStateException("Available nodes: "
                     + availableNodes + ", quorum:" + quorum));
-            return closestNodes;
+            return;
         }
 
-        return closestNodes;
+        NodeState closest = closestNodes.get(closestNodes.firstKey());
+        response.ownerNodeId = closest.id;
+        response.isLocalHostOwner = response.ownerNodeId.equals(getHost().getId());
+        response.ownerNodeGroupReference = closest.groupReference;
+        response.selectedNodes = closestNodes.values();
+        response.membershipUpdateTimeMicros = localState.membershipUpdateTimeMicros;
     }
 
     private void broadcast(Operation op, SelectAndForwardRequest req,
@@ -361,7 +369,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             return;
         }
 
-        rsp.membershipQuorum = this.cachedGroupState.nodes.get(getHost().getId()).membershipQuorum;
+        rsp.membershipQuorum = this.cachedState.membershipQuorum;
 
         AtomicInteger availableNodeCount = new AtomicInteger();
         CompletionHandler c = (o, e) -> {
@@ -407,7 +415,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
                     .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_FORWARDING)
                     .setAction(op.getAction())
                     .setCompletion(c)
-                    .setReferer(op.getReferer())
+                    .transferRefererFrom(op)
                     .setExpiration(op.getExpirationMicrosUtc())
                     .setBody(op.getBodyRaw());
 
@@ -465,7 +473,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
      */
     public void handleMaintenance(Operation maintOp) {
         performPendingRequestMaintenance();
-        checkAndScheduleSynchronization();
+        checkAndScheduleSynchronization(this.cachedGroupState.membershipUpdateTimeMicros);
         maintOp.complete();
     }
 
@@ -480,8 +488,6 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             return;
         }
 
-        MessageDigest digest = Utils.createDigest();
-
         while (!this.pendingRequests.isEmpty()) {
             SelectAndForwardRequest req = this.pendingRequests.poll();
             if (req == null) {
@@ -491,24 +497,25 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
                 req.associatedOp.fail(new CancellationException());
                 continue;
             }
-            selectAndForward(req, req.associatedOp, this.cachedGroupState, digest);
+
+            selectAndForward(req, req.associatedOp, this.cachedGroupState);
         }
 
     }
 
-    private void checkAndScheduleSynchronization() {
+    private void checkAndScheduleSynchronization(long membershipUpdateMicros) {
         if (getHost().isStopping()) {
             return;
         }
 
         if (!NodeGroupUtils.isMembershipSettled(getHost(), getHost().getMaintenanceIntervalMicros(),
                 this.cachedGroupState)) {
-            checkConvergence();
+            checkConvergence(membershipUpdateMicros);
             return;
         }
 
         if (!this.isNodeGroupConverged) {
-            checkConvergence();
+            checkConvergence(membershipUpdateMicros);
             return;
         }
 
@@ -523,7 +530,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         getHost().scheduleNodeGroupChangeMaintenance(getSelfLink());
     }
 
-    private void checkConvergence() {
+    private void checkConvergence(long membershipUpdateMicros) {
 
         CompletionHandler c = (o, e) -> {
             if (e != null) {
@@ -533,8 +540,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
 
             final int quorumWarningsBeforeQuiet = 10;
             NodeGroupState ngs = o.getBody(NodeGroupState.class);
-            long membershipUpdate = ngs.membershipUpdateTimeMicros;
-            this.cachedGroupState = ngs;
+            updateCachedNodeGroupState(ngs, null);
             Operation op = Operation.createPost(null)
                     .setReferer(getUri())
                     .setExpiration(Utils.getNowMicrosUtc() + getHost().getOperationTimeoutMicros());
@@ -560,16 +566,59 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
                                     return;
                                 }
 
+                                this.hashedNodeIds.clear();
+
                                 // if node group changed since we kicked of this check, we need to wait for
                                 // newer convergence completions
-                                this.isNodeGroupConverged = membershipUpdate == this.cachedGroupState.membershipUpdateTimeMicros;
-                                if (this.isNodeGroupConverged) {
-                                    this.synchQuorumWarningCount = 0;
+                                synchronized (this.cachedState) {
+                                    this.isNodeGroupConverged = membershipUpdateMicros == this.cachedGroupState.membershipUpdateTimeMicros;
+                                    if (this.isNodeGroupConverged) {
+                                        this.synchQuorumWarningCount = 0;
+                                    }
                                 }
                             }));
         };
 
         sendRequest(Operation.createGet(this, this.cachedState.nodeGroupLink).setCompletion(c));
+    }
+
+    private void updateCachedNodeGroupState(NodeGroupState ngs, UpdateQuorumRequest quorumUpdate) {
+        if (ngs != null) {
+            NodeGroupState currentState = this.cachedGroupState;
+            if (currentState != null && currentState.nodes.size() != ngs.nodes.size()) {
+                logInfo("Node count: %d", ngs.nodes.size());
+            }
+        } else {
+            logInfo("Quorum update: %d", quorumUpdate.membershipQuorum);
+        }
+
+        long now = Utils.getNowMicrosUtc();
+        synchronized (this.cachedState) {
+            if (quorumUpdate != null) {
+                this.cachedState.documentUpdateTimeMicros = now;
+                this.cachedState.membershipQuorum = quorumUpdate.membershipQuorum;
+                if (this.cachedGroupState != null) {
+                    this.cachedGroupState.nodes.get(
+                            getHost().getId()).membershipQuorum = quorumUpdate.membershipQuorum;
+                }
+                return;
+            }
+
+            if (this.cachedGroupState == null) {
+                this.cachedGroupState = ngs;
+            }
+
+            if (this.cachedGroupState.documentUpdateTimeMicros <= ngs.documentUpdateTimeMicros) {
+                this.cachedState.documentUpdateTimeMicros = now;
+                this.cachedState.membershipUpdateTimeMicros = ngs.membershipUpdateTimeMicros;
+                this.cachedGroupState = ngs;
+                // every time we update cached state, request convergence check
+                this.isNodeGroupConverged = false;
+                this.isSynchronizationRequired = true;
+            } else {
+                return;
+            }
+        }
     }
 
     @Override

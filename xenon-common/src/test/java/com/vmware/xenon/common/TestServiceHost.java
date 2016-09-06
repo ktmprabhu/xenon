@@ -15,12 +15,17 @@ package com.vmware.xenon.common;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.File;
 import java.net.URI;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Date;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -38,6 +43,7 @@ import java.util.function.Consumer;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 
 import org.junit.After;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
@@ -47,11 +53,15 @@ import com.vmware.xenon.common.ServiceHost.ServiceAlreadyStartedException;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState.MemoryLimitType;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.jwt.Rfc7519Claims;
+import com.vmware.xenon.common.jwt.Signer;
+import com.vmware.xenon.common.jwt.Verifier;
 import com.vmware.xenon.common.test.AuthorizationHelper;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.TestProperty;
 import com.vmware.xenon.common.test.VerificationHost;
+import com.vmware.xenon.common.test.VerificationHost.WaitHandler;
 import com.vmware.xenon.services.common.AuthorizationContextService;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
@@ -83,6 +93,9 @@ public class TestServiceHost {
     public int indexFileThreshold = 100;
 
     public long serviceCacheClearDelaySeconds = 2;
+
+    @Rule
+    public TemporaryFolder tmpFolder = new TemporaryFolder();
 
     public void beforeHostStart(VerificationHost host) {
         host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS
@@ -130,7 +143,7 @@ public class TestServiceHost {
         String userPath = AuthorizationHelper.createUserService(this.host, this.host, "someone@example.org");
         this.host.resetAuthorizationContext();
 
-        this.host.assumeIdentity(userPath, null);
+        this.host.assumeIdentity(userPath);
 
         // set limit for this user to 1 request / second
         this.host.setRequestRateLimit(userPath, 1.0);
@@ -198,17 +211,16 @@ public class TestServiceHost {
     public void startUpWithArgumentsAndHostConfigValidation() throws Throwable {
         setUp(false);
         ExampleServiceHost h = new ExampleServiceHost();
-        TemporaryFolder tmpFolder = new TemporaryFolder();
-        tmpFolder.create();
         try {
             String bindAddress = "127.0.0.1";
+            URI publicUri = new URI("http://somehost.com:1234");
             String hostId = UUID.randomUUID().toString();
 
             String[] args = {
-                    "--sandbox="
-                            + tmpFolder.getRoot().toURI(),
+                    "--sandbox=" + this.tmpFolder.getRoot().toURI(),
                     "--port=0",
                     "--bindAddress=" + bindAddress,
+                    "--publicUri=" + publicUri.toString(),
                     "--id=" + hostId
             };
 
@@ -230,20 +242,22 @@ public class TestServiceHost {
 
             h.start();
 
+            assertTrue(UriUtils.isHostEqual(h, publicUri));
+
             assertEquals(bindAddress, h.getPreferredAddress());
 
             assertEquals(bindAddress, h.getUri().getHost());
 
             assertEquals(hostId, h.getId());
-            assertEquals(h.getUri(), h.getPublicUri());
+            assertEquals(publicUri, h.getPublicUri());
 
             // confirm the node group self node entry uses the public URI for the bind address
             NodeGroupState ngs = this.host.getServiceState(null, NodeGroupState.class,
                     UriUtils.buildUri(h.getUri(), ServiceUriPaths.DEFAULT_NODE_GROUP));
 
             NodeState selfEntry = ngs.nodes.get(h.getId());
-            assertEquals(bindAddress, selfEntry.groupReference.getHost());
-            assertEquals(h.getUri().getPort(), selfEntry.groupReference.getPort());
+            assertEquals(publicUri.getHost(), selfEntry.groupReference.getHost());
+            assertEquals(publicUri.getPort(), selfEntry.groupReference.getPort());
 
             // validate memory limits per service
             long maxMemory = Runtime.getRuntime().maxMemory() / (1024 * 1024);
@@ -320,8 +334,7 @@ public class TestServiceHost {
             String [] args2 = {
                     "--port=" + 0,
                     "--bindAddress=" + bindAddress,
-                    "--sandbox="
-                            + tmpFolder.getRoot().toURI(),
+                    "--sandbox=" + this.tmpFolder.getRoot().toURI(),
                     "--id=" + hostId
             };
 
@@ -334,7 +347,6 @@ public class TestServiceHost {
             verifyAuthorizedServiceMethods(h);
         } finally {
             h.stop();
-            tmpFolder.delete();
         }
 
     }
@@ -351,7 +363,7 @@ public class TestServiceHost {
         }
 
         try {
-            h.cacheAuthorizationContext(s, UUID.randomUUID().toString(),
+            h.cacheAuthorizationContext(s,
                     this.host.getGuestAuthorizationContext());
             throw new IllegalStateException("call should have failed");
         } catch (IllegalStateException e) {
@@ -365,8 +377,6 @@ public class TestServiceHost {
     public void setPublicUri() throws Throwable {
         setUp(false);
         ExampleServiceHost h = new ExampleServiceHost();
-        TemporaryFolder tmpFolder = new TemporaryFolder();
-        tmpFolder.create();
 
         try {
 
@@ -404,8 +414,7 @@ public class TestServiceHost {
             String hostId = UUID.randomUUID().toString();
 
             String[] args = {
-                    "--sandbox="
-                            + tmpFolder.getRoot().getAbsolutePath(),
+                    "--sandbox=" + this.tmpFolder.getRoot().getAbsolutePath(),
                     "--port=0",
                     "--bindAddress=" + bindAddress,
                     "--publicUri=" + new URI("http://" + publicAddress + ":" + publicPort),
@@ -433,24 +442,228 @@ public class TestServiceHost {
             assertEquals(publicPort, selfEntry.groupReference.getPort());
         } finally {
             h.stop();
-            tmpFolder.delete();
         }
 
     }
 
     @Test
+    public void jwtSecret() throws Throwable {
+        setUp(false);
+
+        Claims claims = new Claims.Builder().setSubject("foo").getResult();
+
+        Signer bogusSigner = new Signer("bogus".getBytes());
+        Signer defaultSigner = this.host.getTokenSigner();
+        Verifier defaultVerifier = this.host.getTokenVerifier();
+
+        String signedByBogus = bogusSigner.sign(claims);
+        String signedByDefault = defaultSigner.sign(claims);
+
+        try {
+            defaultVerifier.verify(signedByBogus);
+            fail("Signed by bogusSigner should be invalid for defaultVerifier.");
+        } catch (Verifier.InvalidSignatureException ex) {
+        }
+
+        Rfc7519Claims verified = defaultVerifier.verify(signedByDefault);
+        assertEquals("foo", verified.getSubject());
+
+        this.host.stop();
+
+        // assign cert and private-key. private-key is used for JWT seed.
+        URI certFileUri = getClass().getResource("/ssl/server.crt").toURI();
+        URI keyFileUri = getClass().getResource("/ssl/server.pem").toURI();
+
+        this.host.setCertificateFileReference(certFileUri);
+        this.host.setPrivateKeyFileReference(keyFileUri);
+        // must assign port to zero, so we get a *new*, available port on restart.
+        this.host.setPort(0);
+        this.host.start();
+
+        Signer newSigner = this.host.getTokenSigner();
+        Verifier newVerifier = this.host.getTokenVerifier();
+
+        assertNotSame("new signer must be created", defaultSigner, newSigner);
+        assertNotSame("new verifier must be created", defaultVerifier, newVerifier);
+
+        try {
+            newVerifier.verify(signedByDefault);
+            fail("Signed by defaultSigner should be invalid for newVerifier");
+        } catch (Verifier.InvalidSignatureException ex) {
+        }
+
+        // sign by newSigner
+        String signedByNewSigner = newSigner.sign(claims);
+
+        verified = newVerifier.verify(signedByNewSigner);
+        assertEquals("foo", verified.getSubject());
+
+        try {
+            defaultVerifier.verify(signedByNewSigner);
+            fail("Signed by newSigner should be invalid for defaultVerifier");
+        } catch (Verifier.InvalidSignatureException ex) {
+        }
+
+    }
+
+    @Test
+    public void startWithNonEncryptedPem() throws Throwable {
+        ExampleServiceHost h = new ExampleServiceHost();
+        String tmpFolderPath = this.tmpFolder.getRoot().getAbsolutePath();
+
+        // We run test from filesystem so far, thus expect files to be on file system.
+        // For example, if we run test from jar file, needs to copy the resource to tmp dir.
+        Path certFilePath = Paths.get(getClass().getResource("/ssl/server.crt").toURI());
+        Path keyFilePath = Paths.get(getClass().getResource("/ssl/server.pem").toURI());
+        String certFile = certFilePath.toFile().getAbsolutePath();
+        String keyFile = keyFilePath.toFile().getAbsolutePath();
+
+        String[] args = {
+                "--sandbox=" + tmpFolderPath,
+                "--port=0",
+                "--securePort=0",
+                "--certificateFile=" + certFile,
+                "--keyFile=" + keyFile
+        };
+
+        try {
+            h.initialize(args);
+            h.start();
+        } finally {
+            h.stop();
+        }
+
+        // with wrong password
+        args = new String[] {
+                "--sandbox=" + tmpFolderPath,
+                "--port=0",
+                "--securePort=0",
+                "--certificateFile=" + certFile,
+                "--keyFile=" + keyFile,
+                "--keyPassphrase=WRONG_PASSWORD",
+        };
+
+        try {
+            h.initialize(args);
+            h.start();
+            fail("Host should NOT start with password for non-encrypted pem key");
+        } catch (Exception ex) {
+        } finally {
+            h.stop();
+        }
+
+    }
+
+    @Test
+    public void startWithEncryptedPem() throws Throwable {
+        ExampleServiceHost h = new ExampleServiceHost();
+        String tmpFolderPath = this.tmpFolder.getRoot().getAbsolutePath();
+
+        // We run test from filesystem so far, thus expect files to be on file system.
+        // For example, if we run test from jar file, needs to copy the resource to tmp dir.
+        Path certFilePath = Paths.get(getClass().getResource("/ssl/server.crt").toURI());
+        Path keyFilePath = Paths.get(getClass().getResource("/ssl/server-with-pass.p8").toURI());
+        String certFile = certFilePath.toFile().getAbsolutePath();
+        String keyFile = keyFilePath.toFile().getAbsolutePath();
+
+        String[] args = {
+                "--sandbox=" + tmpFolderPath,
+                "--port=0",
+                "--securePort=0",
+                "--certificateFile=" + certFile,
+                "--keyFile=" + keyFile,
+                "--keyPassphrase=password",
+        };
+
+        try {
+            h.initialize(args);
+            h.start();
+        } finally {
+            h.stop();
+        }
+
+        // with wrong password
+        args = new String[] {
+                "--sandbox=" + tmpFolderPath,
+                "--port=0",
+                "--securePort=0",
+                "--certificateFile=" + certFile,
+                "--keyFile=" + keyFile,
+                "--keyPassphrase=WRONG_PASSWORD",
+        };
+
+        try {
+            h.initialize(args);
+            h.start();
+            fail("Host should NOT start with wrong password for encrypted pem key");
+        } catch (Exception ex) {
+        } finally {
+            h.stop();
+        }
+
+        // with no password
+        args = new String[] {
+                "--sandbox=" + tmpFolderPath,
+                "--port=0",
+                "--securePort=0",
+                "--certificateFile=" + certFile,
+                "--keyFile=" + keyFile,
+        };
+
+        try {
+            h.initialize(args);
+            h.start();
+            fail("Host should NOT start when no password is specified for encrypted pem key");
+        } catch (Exception ex) {
+        } finally {
+            h.stop();
+        }
+
+    }
+
+    @Test
+    public void httpsOnly() throws Throwable {
+        ExampleServiceHost h = new ExampleServiceHost();
+        String tmpFolderPath = this.tmpFolder.getRoot().getAbsolutePath();
+
+        // We run test from filesystem so far, thus expect files to be on file system.
+        // For example, if we run test from jar file, needs to copy the resource to tmp dir.
+        Path certFilePath = Paths.get(getClass().getResource("/ssl/server.crt").toURI());
+        Path keyFilePath = Paths.get(getClass().getResource("/ssl/server.pem").toURI());
+        String certFile = certFilePath.toFile().getAbsolutePath();
+        String keyFile = keyFilePath.toFile().getAbsolutePath();
+
+        // set -1 to disable http
+        String[] args = {
+                "--sandbox=" + tmpFolderPath,
+                "--port=-1",
+                "--securePort=0",
+                "--certificateFile=" + certFile,
+                "--keyFile=" + keyFile
+        };
+
+        try {
+            h.initialize(args);
+            h.start();
+
+            assertNull("http should be disabled", h.getListener());
+            assertNotNull("https should be enabled", h.getSecureListener());
+        } finally {
+            h.stop();
+        }
+    }
+
+
+    @Test
     public void setAuthEnforcement() throws Throwable {
         setUp(false);
         ExampleServiceHost h = new ExampleServiceHost();
-        TemporaryFolder tmpFolder = new TemporaryFolder();
-        tmpFolder.create();
         try {
             String bindAddress = "127.0.0.1";
             String hostId = UUID.randomUUID().toString();
 
             String[] args = {
-                    "--sandbox="
-                            + tmpFolder.getRoot().getAbsolutePath(),
+                    "--sandbox=" + this.tmpFolder.getRoot().getAbsolutePath(),
                     "--port=0",
                     "--bindAddress=" + bindAddress,
                     "--isAuthorizationEnabled=" + Boolean.TRUE.toString(),
@@ -479,7 +692,6 @@ public class TestServiceHost {
             this.host.testWait();
         } finally {
             h.stop();
-            tmpFolder.delete();
         }
 
     }
@@ -594,7 +806,7 @@ public class TestServiceHost {
     }
 
     @Test
-    public void serviceHostMaintenanceAndStatsReporting() throws Throwable {
+    public void maintenanceAndStatsReporting() throws Throwable {
         setUp(true);
 
         // induce host to clear service state cache by setting mem limit low
@@ -634,6 +846,7 @@ public class TestServiceHost {
 
         long cacheMissCount = 0;
         long cacheClearCount = 0;
+        ServiceStat cacheClearStat = null;
         Map<URI, ServiceStats> servicesWithMaintenance = new HashMap<>();
 
         // guarantee at least a few intervals have passed. Other we risk false negatives.
@@ -697,9 +910,21 @@ public class TestServiceHost {
                 continue;
             }
 
+            Map<String, ServiceStat> mgmtStats = this.host.getServiceStats(this.host.getManagementServiceUri());
+            cacheClearStat = mgmtStats.get(ServiceHostManagementService.STAT_NAME_SERVICE_CACHE_CLEAR_COUNT);
+            if (cacheClearStat == null || cacheClearStat.latestValue < 1) {
+                this.host.log("Cache clear stat on management service not seen");
+                Thread.sleep(maintIntervalMillis * 2);
+                continue;
+            }
             break;
         }
         long end = Utils.getNowMicrosUtc();
+
+        if (cacheClearStat == null || cacheClearStat.latestValue < 1) {
+            throw new IllegalStateException(
+                    "Cache clear stat on management service not observed");
+        }
 
         this.host.log("State cache misses: %d, cache clears: %d", cacheMissCount, cacheClearCount);
 
@@ -772,36 +997,6 @@ public class TestServiceHost {
         }
         this.host.testWait();
 
-        // Test expiration: create N factory services, with expiration set in the initial state
-        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
-
-        List<URI> exampleURIs = new ArrayList<>();
-        this.host.createExampleServices(this.host, this.serviceCount, exampleURIs,
-                Utils.getNowMicrosUtc());
-
-        ServiceDocumentQueryResult rsp = new ServiceDocumentQueryResult();
-        exp = this.host.getTestExpiration();
-        while (new Date().before(exp)) {
-
-            // let maintenance run
-            Thread.sleep(maintIntervalMillis);
-            rsp = this.host.getFactoryState(UriUtils.buildFactoryUri(this.host,
-                    ExampleService.class));
-            if (rsp.documentLinks == null || rsp.documentLinks.size() == 0) {
-                break;
-            }
-        }
-
-        if (rsp.documentLinks != null && rsp.documentLinks.size() > 0) {
-            throw new IllegalStateException(
-                    "Services are not expired:" + Utils.toJson(rsp));
-        }
-
-        // also verify expiration induced DELETE has resulted in permanent removal of all versions
-        // of the document
-
-        this.host.validatePermanentServiceDocumentDeletion(ExampleService.FACTORY_LINK, 0,
-                true);
 
         // now validate that service handleMaintenance does not get called right after start, but at least
         // one interval later. We set the interval to 30 seconds so we can verify it did not get called within
@@ -834,6 +1029,34 @@ public class TestServiceHost {
                 }
             }
         }
+
+        URI serviceHostMgmtURI = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_MANAGEMENT);
+        // confirm host global time series stats have been created / updated
+        Map<String, ServiceStat> hostMgmtStats = this.host.getServiceStats(serviceHostMgmtURI);
+        ServiceStat freeMemDaily = hostMgmtStats
+                .get(ServiceHostManagementService.STAT_NAME_AVAILABLE_MEMORY_BYTES_PER_DAY);
+        ServiceStat freeMemHourly = hostMgmtStats
+                .get(ServiceHostManagementService.STAT_NAME_AVAILABLE_MEMORY_BYTES_PER_HOUR);
+        ServiceStat freeDiskDaily = hostMgmtStats
+                .get(ServiceHostManagementService.STAT_NAME_AVAILABLE_DISK_BYTES_PER_DAY);
+        ServiceStat freeDiskHourly = hostMgmtStats
+                .get(ServiceHostManagementService.STAT_NAME_AVAILABLE_DISK_BYTES_PER_HOUR);
+        ServiceStat cpuUsageDaily = hostMgmtStats
+                .get(ServiceHostManagementService.STAT_NAME_CPU_USAGE_PCT_PER_DAY);
+        ServiceStat cpuUsageHourly = hostMgmtStats
+                .get(ServiceHostManagementService.STAT_NAME_CPU_USAGE_PCT_PER_HOUR);
+        ServiceStat threadCountDaily = hostMgmtStats
+                .get(ServiceHostManagementService.STAT_NAME_THREAD_COUNT_PER_DAY);
+        ServiceStat threadCountHourly = hostMgmtStats
+                .get(ServiceHostManagementService.STAT_NAME_THREAD_COUNT_PER_HOUR);
+        TestUtilityService.validateTimeSeriesStat(freeMemDaily, TimeUnit.HOURS.toMillis(1));
+        TestUtilityService.validateTimeSeriesStat(freeMemHourly, TimeUnit.MINUTES.toMillis(1));
+        TestUtilityService.validateTimeSeriesStat(freeDiskDaily, TimeUnit.HOURS.toMillis(1));
+        TestUtilityService.validateTimeSeriesStat(freeDiskHourly, TimeUnit.MINUTES.toMillis(1));
+        TestUtilityService.validateTimeSeriesStat(cpuUsageDaily, TimeUnit.HOURS.toMillis(1));
+        TestUtilityService.validateTimeSeriesStat(cpuUsageHourly, TimeUnit.MINUTES.toMillis(1));
+        TestUtilityService.validateTimeSeriesStat(threadCountDaily, TimeUnit.HOURS.toMillis(1));
+        TestUtilityService.validateTimeSeriesStat(threadCountHourly, TimeUnit.MINUTES.toMillis(1));
     }
 
     private void verifyMaintenanceDelayStat(long intervalMicros) throws Throwable {
@@ -954,18 +1177,64 @@ public class TestServiceHost {
         this.host.testWait();
     }
 
+    @Test
+    public void registerForServiceAvailabilityWithReplicaBeforeAndAfterMultiple()
+            throws Throwable {
+        setUp(true);
+        this.host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(100));
+
+        String[] links = new String[] {
+                ExampleService.FACTORY_LINK,
+                ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS,
+                ServiceUriPaths.CORE_AUTHZ_USERS,
+                ServiceUriPaths.CORE_AUTHZ_ROLES,
+                ServiceUriPaths.CORE_AUTHZ_USER_GROUPS };
+
+        // register multiple factories, before host start
+        TestContext ctx = this.host.testCreate(links.length * 10);
+        for (int i = 0; i < 10; i++) {
+            this.host.registerForServiceAvailability(ctx.getCompletion(), true, links);
+        }
+        this.host.start();
+        this.host.testWait(ctx);
+
+        // register multiple factories, after host start
+        for (int i = 0; i < 10; i++) {
+            ctx = this.host.testCreate(links.length);
+            this.host.registerForServiceAvailability(ctx.getCompletion(), true, links);
+            this.host.testWait(ctx);
+        }
+
+        // verify that the new replica aware service available works with child services
+        int serviceCount = 10;
+        ctx = this.host.testCreate(serviceCount * 3);
+        links = new String[serviceCount];
+        for (int i = 0; i < serviceCount; i++) {
+            URI u = UriUtils.buildUri(this.host, UUID.randomUUID().toString());
+            links[i] = u.getPath();
+            this.host.registerForServiceAvailability(ctx.getCompletion(),
+                    u.getPath());
+            this.host.startService(Operation.createPost(u),
+                    ExampleService.createFactory());
+            this.host.registerForServiceAvailability(ctx.getCompletion(), true,
+                    u.getPath());
+        }
+        this.host.registerForServiceAvailability(ctx.getCompletion(),
+                links);
+
+        this.host.testWait(ctx);
+    }
+
     public static class ParentService extends StatefulService {
 
         public static final String FACTORY_LINK = "/test/parent";
 
         public static Service createFactory() {
-            return FactoryService.create(ParentService.class, ExampleServiceState.class);
+            return FactoryService.create(ParentService.class);
         }
 
         public ParentService() {
             super(ExampleServiceState.class);
-            super.toggleOption(ServiceOption.REPLICATION, true);
-            super.toggleOption(ServiceOption.OWNER_SELECTION, true);
             super.toggleOption(ServiceOption.PERSISTENCE, true);
         }
     }
@@ -974,14 +1243,11 @@ public class TestServiceHost {
         public static final String FACTORY_LINK = "/test/child-of-parent";
 
         public static Service createFactory() {
-            return FactoryService.create(ChildDependsOnParentService.class,
-                    ExampleServiceState.class);
+            return FactoryService.create(ChildDependsOnParentService.class);
         }
 
         public ChildDependsOnParentService() {
             super(ExampleServiceState.class);
-            super.toggleOption(ServiceOption.REPLICATION, true);
-            super.toggleOption(ServiceOption.OWNER_SELECTION, true);
             super.toggleOption(ServiceOption.PERSISTENCE, true);
         }
 
@@ -1040,6 +1306,7 @@ public class TestServiceHost {
         ctx = this.host.testCreate(1);
         String childPath = UriUtils.buildUriPath(ChildDependsOnParentService.FACTORY_LINK, id);
         Operation get = Operation.createGet(UriUtils.buildUri(this.host, childPath))
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY)
                 .setCompletion(ctx.getCompletion());
         this.host.send(get);
         ctx.await();
@@ -1091,10 +1358,12 @@ public class TestServiceHost {
         // set memory limit low to force service pause
         this.host.setServiceMemoryLimit(ServiceHost.ROOT_PATH, 0.00001);
         beforeHostStart(this.host);
+
         this.host.setPort(0);
         long delayMicros = TimeUnit.SECONDS
                 .toMicros(this.serviceCacheClearDelaySeconds);
         this.host.setServiceCacheClearDelayMicros(delayMicros);
+
         // disable auto sync since it might cause a false negative (skipped pauses) when
         // it kicks in within a few milliseconds from host start, during induced pause
         this.host.setPeerSynchronizationEnabled(false);
@@ -1112,54 +1381,35 @@ public class TestServiceHost {
             o.setBody(s);
         };
 
+        // Create a number of child services.
         URI factoryURI = UriUtils.buildFactoryUri(this.host, ExampleService.class);
-
         Map<URI, ExampleServiceState> states = this.host.doFactoryChildServiceStart(null,
                 this.serviceCount,
                 ExampleServiceState.class, bodySetter, factoryURI);
 
-        // while pausing, issue updates to verify behavior under load. Services should either abort pause,
-        // or be ignored due to recent update
+        // Wait for the next maintenance interval to trigger. This will pause all the services
+        // we just created since the memory limit was set so low.
+        long expectedPauseTime = Utils.getNowMicrosUtc() + this.host.getMaintenanceIntervalMicros() * 5;
+        while (this.host.getState().lastMaintenanceTimeUtcMicros < expectedPauseTime) {
+            // memory limits are applied during maintenance, so wait for a few intervals.
+            Thread.sleep(this.host.getMaintenanceIntervalMicros() / 1000);
+        }
+
+        // Let's now issue some updates to verify paused services get resumed.
         int updateCount = 100;
         if (this.testDurationSeconds > 0 || this.host.isStressTest()) {
             updateCount = 1;
         }
         patchExampleServices(states, updateCount);
 
-        long expectedPauseTime = Utils.getNowMicrosUtc() + this.host.getMaintenanceIntervalMicros()
-                * 5;
-        while (this.host.getState().lastMaintenanceTimeUtcMicros < expectedPauseTime) {
-            // memory limits are applied during maintenance, so wait for a few intervals.
-            Thread.sleep(this.host.getMaintenanceIntervalMicros() / 1000);
-        }
-
-        // restore memory limit so we don't keep re-pausing/resuming services every time we talk to them.
-        // In addition, if we try to get the stats from a service that was just scheduled for pause, the pause will
-        // be cancelled, causing a test false negative (no pauses observed)
+        // Let's set the service memory limit back to normal and issue more updates to ensure
+        // that the services still continue to operate as expected.
         this.host
                 .setServiceMemoryLimit(ServiceHost.ROOT_PATH, ServiceHost.DEFAULT_PCT_MEMORY_LIMIT);
+        patchExampleServices(states, updateCount);
 
-        // services should all be paused now since we set the host memory limit so low. Send requests to
-        // prove resume worked. We will then verify the per stats to make sure both pause and resume actually occurred
-        patchExampleServices(states, 1);
-
-        Map<String, ServiceStats> stats = Collections.synchronizedMap(new HashMap<>());
-        this.host.testStart(states.size() * 2);
+        this.host.testStart(states.size());
         for (ExampleServiceState st : states.values()) {
-
-            Operation getStats = Operation.createGet(
-                    UriUtils.buildStatsUri(UriUtils.buildUri(this.host, st.documentSelfLink)))
-                    .setCompletion((o, e) -> {
-                        if (e != null) {
-                            this.host.failIteration(e);
-                            return;
-                        }
-                        ServiceStats rsp = o.getBody(ServiceStats.class);
-                        stats.put(st.documentSelfLink, rsp);
-                        this.host.completeIteration();
-                    });
-            this.host.send(getStats);
-
             Operation get = Operation.createGet(UriUtils.buildUri(this.host, st.documentSelfLink))
                     .setCompletion(
                             (o, e) -> {
@@ -1182,18 +1432,7 @@ public class TestServiceHost {
         this.host.testWait();
 
         if (this.testDurationSeconds == 0) {
-            for (ServiceStats statsPerInstance : stats.values()) {
-                ServiceStat pauseStat = statsPerInstance.entries.get(Service.STAT_NAME_PAUSE_COUNT);
-                ServiceStat resumeStat = statsPerInstance.entries
-                        .get(Service.STAT_NAME_RESUME_COUNT);
-                if (pauseStat == null) {
-                    throw new IllegalStateException("No pauses observed");
-                }
-                if (resumeStat == null) {
-                    throw new IllegalStateException("No resumes observed");
-                }
-            }
-            return;
+            verifyPauseResumeStats(states);
         }
 
         states.clear();
@@ -1259,6 +1498,129 @@ public class TestServiceHost {
         }
     }
 
+    private void verifyPauseResumeStats(Map<URI, ExampleServiceState> states) throws Throwable {
+        // Let's now query stats for each service. We will use these stats to verify that the
+        // services did get paused and resumed.
+        WaitHandler wh = () -> {
+            // Verify the stats for each service show that the service was paused and resumed
+            for (ExampleServiceState st : states.values()) {
+                URI serviceUri = UriUtils.buildUri(this.host, st.documentSelfLink);
+                Map<String, ServiceStat> serviceStats = this.host.getServiceStats(serviceUri);
+
+                ServiceStat pauseStat = serviceStats.get(Service.STAT_NAME_PAUSE_COUNT);
+                if (pauseStat == null) {
+                    this.host.log("pauseStat was null for %s", st.documentSelfLink);
+                    return false;
+                }
+
+                ServiceStat resumeStat = serviceStats.get(Service.STAT_NAME_RESUME_COUNT);
+                if (resumeStat == null) {
+                    this.host.log("resumeStat was null for %s", st.documentSelfLink);
+                    return false;
+                }
+            }
+
+            // Verify the stats for the management service show that the pause and resume service count
+            // is as expected
+            Map<String, ServiceStat> mgmtStats = this.host.getServiceStats(this.host
+                    .getManagementServiceUri());
+
+            ServiceStat mgmtPauseStat = mgmtStats.get(
+                    ServiceHostManagementService.STAT_NAME_SERVICE_PAUSE_COUNT);
+
+            if (mgmtPauseStat == null || (int) mgmtPauseStat.latestValue < states.size()) {
+                this.host.log("ManagementSvc pauseStat was not set as expected %s",
+                        mgmtPauseStat == null ? "null" : String.valueOf(mgmtPauseStat.latestValue));
+                return false;
+            }
+
+            ServiceStat mgmtResumeStat = mgmtStats.get(
+                    ServiceHostManagementService.STAT_NAME_SERVICE_PAUSE_COUNT);
+            if (mgmtResumeStat == null || (int) mgmtResumeStat.latestValue < states.size()) {
+                this.host.log(
+                        "ManagementSvc resumeStat was not set as expected %s",
+                        mgmtResumeStat == null ? "null" : String
+                                .valueOf(mgmtResumeStat.latestValue));
+                return false;
+            }
+
+            return true;
+        };
+        this.host.waitFor("Service stats did not get updated", wh);
+    }
+
+    @Test
+    public void maintenanceForOnDemandLoadServices() throws Throwable {
+        setUp(true);
+
+        long maintenanceIntervalMillis = 100;
+        long maintenanceIntervalMicros = TimeUnit.MILLISECONDS
+                .toMicros(maintenanceIntervalMillis);
+
+        // induce host to clear service state cache by setting mem limit low
+        this.host.setMaintenanceIntervalMicros(maintenanceIntervalMicros);
+        this.host.setServiceCacheClearDelayMicros(maintenanceIntervalMicros / 2);
+        this.host.start();
+
+        EnumSet<ServiceOption> caps = EnumSet.of(ServiceOption.PERSISTENCE,
+                ServiceOption.INSTRUMENTATION, ServiceOption.ON_DEMAND_LOAD, ServiceOption.FACTORY_ITEM);
+
+        // Start the factory service. it will be needed to start services on-demand
+        MinimalFactoryTestService factoryService = new MinimalFactoryTestService();
+        factoryService.setChildServiceCaps(caps);
+        this.host.startServiceAndWait(factoryService, "service", null);
+
+        // Start some test services with ServiceOption.ON_DEMAND_LOAD
+        List<Service> services = this.host.doThroughputServiceStart(this.serviceCount,
+                MinimalTestService.class, this.host.buildMinimalTestState(), caps, null);
+
+        // guarantee at least a few maintenance intervals have passed.
+        Thread.sleep(maintenanceIntervalMillis * 10);
+
+        // Let's verify now that all of the services have stopped by now.
+        this.host.waitFor("Service stats did not get updated", () -> {
+            int stoppedCount = 0;
+            for (Service svc : services) {
+                MinimalTestService service = (MinimalTestService) svc;
+                if (service.gotStopped) {
+                    stoppedCount++;
+                }
+            }
+
+            if (stoppedCount < this.serviceCount) {
+                this.host.log("StoppedCount %d is less than expected %d", stoppedCount, this.serviceCount);
+                return false;
+            }
+
+            Map<String, ServiceStat> stats = this.host.getServiceStats(this.host.getManagementServiceUri());
+            ServiceStat odlStops = stats.get(ServiceHostManagementService.STAT_NAME_ODL_STOP_COUNT);
+            if (odlStops == null || odlStops.latestValue < this.serviceCount) {
+                this.host.log("ODL Service Stops %s were less than expected %d",
+                        odlStops == null ? "null" : String.valueOf(odlStops.latestValue),
+                        this.serviceCount);
+                return false;
+            }
+
+            ServiceStat odlCacheClears = stats.get(ServiceHostManagementService.STAT_NAME_ODL_CACHE_CLEAR_COUNT);
+            if (odlCacheClears == null || odlCacheClears.latestValue < this.serviceCount) {
+                this.host.log("ODL Service Cache Clears %s were less than expected %d",
+                        odlCacheClears == null ? "null" : String.valueOf(odlCacheClears.latestValue),
+                        this.serviceCount);
+                return false;
+            }
+
+            ServiceStat cacheClears = stats.get(ServiceHostManagementService.STAT_NAME_SERVICE_CACHE_CLEAR_COUNT);
+            if (cacheClears == null || cacheClears.latestValue < this.serviceCount) {
+                this.host.log("Service Cache Clears %s were less than expected %d",
+                        cacheClears == null ? "null" : String.valueOf(cacheClears.latestValue),
+                        this.serviceCount);
+                return false;
+            }
+
+            return true;
+        });
+    }
+
     private void patchExampleServices(Map<URI, ExampleServiceState> states, int count)
             throws Throwable {
         this.host.testStart(states.size() * count);
@@ -1273,6 +1635,118 @@ public class TestServiceHost {
             }
         }
         this.host.testWait();
+    }
+
+    @Test
+    public void onDemandServiceStopCheckWithReadAndWriteAccess() throws Throwable {
+        setUp(true);
+
+        long maintenanceIntervalMicros = TimeUnit.MILLISECONDS.toMicros(100);
+
+        // induce host to stop ON_DEMAND_SERVICE more often by setting maintenance interval short
+        this.host.setMaintenanceIntervalMicros(maintenanceIntervalMicros);
+        this.host.setServiceCacheClearDelayMicros(maintenanceIntervalMicros / 2);
+        this.host.start();
+
+        // Start some test services with ServiceOption.ON_DEMAND_LOAD
+        EnumSet<ServiceOption> caps = EnumSet.of(ServiceOption.PERSISTENCE,
+                ServiceOption.INSTRUMENTATION, ServiceOption.ON_DEMAND_LOAD,
+                ServiceOption.FACTORY_ITEM);
+
+        MinimalFactoryTestService factoryService = new MinimalFactoryTestService();
+        factoryService.setChildServiceCaps(caps);
+        this.host.startServiceAndWait(factoryService, "/service", null);
+
+        final double stopCount = getODLStopCountStat() != null ? getODLStopCountStat().latestValue : 0;
+
+        // create a ON_DEMAND_LOAD
+        MinimalTestServiceState initialState = new MinimalTestServiceState();
+        initialState.id = "foo";
+        initialState.documentSelfLink = "/foo";
+        Operation startPost = Operation
+                .createPost(UriUtils.buildUri(this.host, "/service"))
+                .setBody(initialState);
+        this.host.sendAndWaitExpectSuccess(startPost);
+
+        String servicePath = "/service/foo";
+
+        // wait for the service to be stopped and stat to be populated
+        // This also verifies that ON_DEMAND_LOAD service will stop while it is idle for some duration
+        this.host.waitFor("Waiting ON_DEMAND_LOAD service to be stopped",
+                () -> this.host.getServiceStage(servicePath) == null
+                        && getODLStopCountStat() != null
+                        && getODLStopCountStat().latestValue > stopCount
+        );
+        long lastODLStopTime = getODLStopCountStat().lastUpdateMicrosUtc;
+
+        int requestCount = 10;
+        int requestDelayMills = 40;
+
+        // Keep the time right before sending the last request.
+        // Use this time to check the service was not stopped at this moment. Since we keep
+        // sending the request with 40ms apart, when last request has sent, service should not
+        // be stopped(within maintenance window and cacheclear delay).
+        long beforeLastRequestSentTime = 0;
+
+        // send 10 GET request 40ms apart to make service receive GET request during a couple
+        // of maintenance windows
+        TestContext testContextForGet = this.host.testCreate(requestCount);
+        for (int i = 0; i < requestCount; i++) {
+            Operation get = Operation
+                    .createGet(this.host, servicePath)
+                    .setCompletion(testContextForGet.getCompletion());
+            beforeLastRequestSentTime = Utils.getNowMicrosUtc();
+            this.host.send(get);
+            Thread.sleep(requestDelayMills);
+        }
+        testContextForGet.await();
+
+        // wait for the service to be stopped
+        final long beforeLastGetSentTime = beforeLastRequestSentTime;
+        this.host.waitFor("Waiting ON_DEMAND_LOAD service to be stopped",
+                () -> {
+                    long currentStopTime = getODLStopCountStat().lastUpdateMicrosUtc;
+                    return lastODLStopTime < currentStopTime
+                            && beforeLastGetSentTime < currentStopTime
+                            && this.host.getServiceStage(servicePath) == null;
+                }
+        );
+
+        long afterGetODLStopTime = getODLStopCountStat().lastUpdateMicrosUtc;
+
+        // send 10 update request 40ms apart to make service receive PATCH request during a couple
+        // of maintenance windows
+        TestContext testContextForPatch = this.host.testCreate(requestCount);
+        for (int i = 0; i < requestCount; i++) {
+            MinimalTestServiceState body = new MinimalTestServiceState();
+            body.id = "foo-" + i;
+            Operation patch = Operation
+                    .createPatch(UriUtils.buildUri(this.host, servicePath))
+                    .setBody(body)
+                    .setCompletion(this.host.getSafeHandler(testContextForPatch, (o, e) -> {
+                    }));
+            beforeLastRequestSentTime = Utils.getNowMicrosUtc();
+            this.host.send(patch);
+            Thread.sleep(requestDelayMills);
+        }
+        testContextForPatch.await();
+
+        // wait for the service to be stopped
+        final long beforeLastPatchSentTime = beforeLastRequestSentTime;
+        this.host.waitFor("Waiting ON_DEMAND_LOAD service to be stopped",
+                () -> {
+                    long currentStopTime = getODLStopCountStat().lastUpdateMicrosUtc;
+                    return afterGetODLStopTime < currentStopTime
+                            && beforeLastPatchSentTime < currentStopTime
+                            && this.host.getServiceStage(servicePath) == null;
+                }
+        );
+    }
+
+    private ServiceStat getODLStopCountStat() throws Throwable {
+        URI managementServiceUri = this.host.getManagementServiceUri();
+        return this.host.getServiceStats(managementServiceUri)
+                .get(ServiceHostManagementService.STAT_NAME_ODL_STOP_COUNT);
     }
 
     @Test
@@ -1411,8 +1885,11 @@ public class TestServiceHost {
         this.host.setCertificateFileReference(ssc.certificate().toURI());
         this.host.setPrivateKeyFileReference(ssc.privateKey().toURI());
 
-        assertEquals("before starting, scheme is NONE", ServiceHost.HttpScheme.NONE, this.host.getCurrentHttpScheme());
+        assertEquals("before starting, scheme is NONE", ServiceHost.HttpScheme.NONE,
+                this.host.getCurrentHttpScheme());
 
+        this.host.setPort(0);
+        this.host.setSecurePort(0);
         this.host.start();
 
         ServiceRequestListener httpListener = this.host.getListener();
@@ -1448,7 +1925,7 @@ public class TestServiceHost {
         // set both HTTP and secure port, to null out the listeners from the host instance.
         this.host.setPort(ServiceHost.PORT_VALUE_LISTENER_DISABLED);
         this.host.setSecurePort(0);
-        VerificationHost.createAndAttachSSLClient(this.host, null, null);
+        VerificationHost.createAndAttachSSLClient(this.host);
         this.host.start();
 
         httpListener = this.host.getListener();
@@ -1464,6 +1941,10 @@ public class TestServiceHost {
 
     @After
     public void tearDown() {
+        LuceneDocumentIndexService.setIndexFileCountThresholdForWriterRefresh(
+                LuceneDocumentIndexService
+                        .DEFAULT_INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH);
+
         if (this.host == null) {
             return;
         }

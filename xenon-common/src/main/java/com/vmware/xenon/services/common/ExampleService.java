@@ -14,12 +14,12 @@
 package com.vmware.xenon.services.common;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
-import java.util.Map.Entry;
+import java.util.Set;
 
 import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
-import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
@@ -38,25 +38,37 @@ public class ExampleService extends StatefulService {
      * Create a default factory service that starts instances of this service on POST.
      * This method is optional, {@code FactoryService.create} can be used directly
      */
-    public static Service createFactory() {
-        Service fs = FactoryService.create(ExampleService.class, ExampleServiceState.class);
-        // Set additional factory service option. This can be set in service constructor as well
-        // but its really relevant on the factory of a service.
-        fs.toggleOption(ServiceOption.IDEMPOTENT_POST, true);
-        return fs;
+    public static FactoryService createFactory() {
+        return FactoryService.create(ExampleService.class);
     }
 
     public static class ExampleServiceState extends ServiceDocument {
         public static final String FIELD_NAME_KEY_VALUES = "keyValues";
         public static final String FIELD_NAME_COUNTER = "counter";
+        public static final String FIELD_NAME_SORTED_COUNTER = "sortedCounter";
         public static final String FIELD_NAME_NAME = "name";
+        public static final String FIELD_NAME_TAGS = "tags";
+        public static final String FIELD_NAME_ID = "id";
+        public static final String FIELD_NAME_REQUIRED = "required";
         public static final long VERSION_RETENTION_LIMIT = 100;
 
         @UsageOption(option = PropertyUsageOption.OPTIONAL)
+        @PropertyOptions(indexing = { PropertyIndexingOption.EXPAND,
+                PropertyIndexingOption.FIXED_ITEM_NAME })
+        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
         public Map<String, String> keyValues = new HashMap<>();
         public Long counter;
+        @PropertyOptions(indexing = PropertyIndexingOption.SORT)
+        public Long sortedCounter;
         @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
         public String name;
+        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
+        public Set<String> tags = new HashSet<>();
+        @UsageOption(option = PropertyUsageOption.ID)
+        @UsageOption(option = PropertyUsageOption.REQUIRED)
+        public String id;
+        @UsageOption(option = PropertyUsageOption.REQUIRED)
+        public String required;
     }
 
     public ExampleService() {
@@ -123,16 +135,10 @@ public class ExampleService extends StatefulService {
         // use helper that will merge automatically current state, with state supplied in body.
         // Note the usage option PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL has been set on the
         // "name" field.
-        boolean hasStateChanged = Utils.mergeWithState(getDocumentTemplate().documentDescription,
+        boolean hasStateChanged = Utils.mergeWithState(getStateDescription(),
                 currentState, body);
 
         updateCounter(body, currentState, hasStateChanged);
-
-        if (body.keyValues != null && !body.keyValues.isEmpty()) {
-            for (Entry<String, String> e : body.keyValues.entrySet()) {
-                currentState.keyValues.put(e.getKey(), e.getValue());
-            }
-        }
 
         if (body.documentExpirationTimeMicros != currentState.documentExpirationTimeMicros) {
             currentState.documentExpirationTimeMicros = body.documentExpirationTimeMicros;
@@ -158,6 +164,24 @@ public class ExampleService extends StatefulService {
         return hasStateChanged;
     }
 
+    @Override
+    public void handleDelete(Operation delete) {
+        if (!delete.hasBody()) {
+            delete.complete();
+            return;
+        }
+
+        // A DELETE can be used to both stop the service, mark it deleted in the index
+        // so its excluded from queries, but it can also set its expiration so its state
+        // history is permanently removed
+        ExampleServiceState currentState = getState(delete);
+        ExampleServiceState st = delete.getBody(ExampleServiceState.class);
+        if (st.documentExpirationTimeMicros > 0) {
+            currentState.documentExpirationTimeMicros = st.documentExpirationTimeMicros;
+        }
+        delete.complete();
+    }
+
     /**
      * Provides a default instance of the service state and allows service author to specify
      * indexing and usage options, per service document property
@@ -170,6 +194,12 @@ public class ExampleService extends StatefulService {
 
         // instruct the index to deeply index the map
         pd.indexingOptions.add(PropertyIndexingOption.EXPAND);
+
+        PropertyDescription pdTags = template.documentDescription.propertyDescriptions.get(
+                ExampleServiceState.FIELD_NAME_TAGS);
+
+        // instruct the index to deeply index the set of tags
+        pdTags.indexingOptions.add(PropertyIndexingOption.EXPAND);
 
         PropertyDescription pdName = template.documentDescription.propertyDescriptions.get(
                 ExampleServiceState.FIELD_NAME_NAME);

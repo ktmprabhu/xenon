@@ -17,15 +17,13 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.OperationJoin;
-import com.vmware.xenon.common.Service;
-import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
-import com.vmware.xenon.common.StatefulService;
-import com.vmware.xenon.common.TaskState;
+import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.TaskState.TaskStage;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
@@ -57,14 +55,15 @@ import com.vmware.xenon.services.common.QueryTask.Query;
  * with just the STARTED TaskStage.
  *
  */
-public class ExampleTaskService extends StatefulService {
+public class ExampleTaskService
+        extends TaskService<ExampleTaskService.ExampleTaskServiceState> {
 
     /**
      * These substages are for tracking the stages unique to our task service. They are only
      * relevant to the STARTED TaskStage. If you create your own task service, these substages
      * will probably be where most of the work happens. See the description above.
      */
-    public static enum SubStage {
+    public enum SubStage {
         QUERY_EXAMPLES, DELETE_EXAMPLES
     }
 
@@ -76,16 +75,12 @@ public class ExampleTaskService extends StatefulService {
     /**
      * Create a default factory service that starts instances of this task service on POST.
      */
-    public static Service createFactory() {
-        Service fs = FactoryService.create(ExampleTaskService.class, ExampleTaskServiceState.class);
-        // Set additional factory service option. This can be set in service constructor as well
-        // but its really relevant on the factory of a service.
-        fs.toggleOption(ServiceOption.IDEMPOTENT_POST, true);
-        fs.toggleOption(ServiceOption.INSTRUMENTATION, true);
-        return fs;
+    public static FactoryService createFactory() {
+        return TaskFactoryService.create(ExampleTaskService.class, ServiceOption.IDEMPOTENT_POST,
+                ServiceOption.INSTRUMENTATION);
     }
 
-    public static class ExampleTaskServiceState extends ServiceDocument {
+    public static class ExampleTaskServiceState extends TaskService.TaskServiceState {
 
         /**
          * Time in seconds before the task expires
@@ -98,19 +93,6 @@ public class ExampleTaskService extends StatefulService {
         public Long taskLifetime;
 
         /**
-         * This field shouldn't be manipulated by clients, but can be examined to see the progress
-         * of the task
-         */
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
-        public TaskState taskInfo;
-
-        /**
-         * If taskInfo.stage == FAILED, this message will say why
-         */
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
-        public String failureMessage;
-
-        /**
          * The current substage. See {@link SubStage}
          */
         @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
@@ -120,8 +102,19 @@ public class ExampleTaskService extends StatefulService {
          * The query we make to the Query Task service, and the result we
          * get back from it.
          */
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
+        @PropertyOptions(usage = {
+                PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL,
+                PropertyUsageOption.SERVICE_USE })
         public QueryTask exampleQueryTask;
+
+        /**
+         * Optional query clause that will be added, with MUST_OCCUR,
+         * to the query used to find example service instances. The default query
+         * uses only the document kind to restrict results to example service documents.
+         */
+        @PropertyOptions(usage = {
+                PropertyUsageOption.OPTIONAL })
+        public Query customQueryClause;
     }
 
     public ExampleTaskService() {
@@ -133,49 +126,34 @@ public class ExampleTaskService extends StatefulService {
     }
 
     /**
-     * This handles the initial POST that creates the task service.
-     */
-    @Override
-    public void handleStart(Operation taskOperation) {
-        ExampleTaskServiceState task = validateStartPost(taskOperation);
-        if (task == null) {
-            return;
-        }
-        taskOperation.complete();
-
-        initializeState(task, taskOperation);
-        sendSelfPatch(task);
-    }
-
-    /**
      * Ensure that the input task is valid.
      *
      * Technically we don't need to require a body since there are no parameters. However,
      * non-example tasks will normally have parameters, so this is an example of how they
      * could be validated.
      */
-    private ExampleTaskServiceState validateStartPost(Operation taskOperation) {
-        if (!taskOperation.hasBody()) {
-            taskOperation.fail(new IllegalArgumentException("POST body is required"));
+    protected ExampleTaskServiceState validateStartPost(Operation taskOperation) {
+        ExampleTaskServiceState task = super.validateStartPost(taskOperation);
+        if (task == null) {
             return null;
         }
 
-        ExampleTaskServiceState task = getBody(taskOperation);
-        if (task.taskInfo != null) {
-            taskOperation.fail(
-                    new IllegalArgumentException("Do not specify taskBody: internal use only"));
-            return null;
+        if (ServiceHost.isServiceCreate(taskOperation)) {
+            // apply validation only for the initial creation POST, not restart. Alternatively,
+            // this code can exist in the handleCreate method
+            if (task.subStage != null) {
+                taskOperation.fail(
+                        new IllegalArgumentException("Do not specify subStage: internal use only"));
+                return null;
+            }
+            if (task.exampleQueryTask != null) {
+                taskOperation.fail(
+                        new IllegalArgumentException(
+                                "Do not specify exampleQueryTask: internal use only"));
+                return null;
+            }
         }
-        if (task.subStage != null) {
-            taskOperation.fail(
-                    new IllegalArgumentException("Do not specify subStage: internal use only"));
-            return null;
-        }
-        if (task.exampleQueryTask != null) {
-            taskOperation.fail(
-                    new IllegalArgumentException("Do not specify taskBody: internal use only"));
-            return null;
-        }
+
         if (task.taskLifetime != null && task.taskLifetime <= 0) {
             taskOperation.fail(
                     new IllegalArgumentException("taskLifetime must be positive"));
@@ -192,9 +170,7 @@ public class ExampleTaskService extends StatefulService {
      * If your task does significant initialization, you may prefer to do it in the
      * CREATED state.
      */
-    private void initializeState(ExampleTaskServiceState task, Operation taskOperation) {
-        task.taskInfo = new TaskState();
-        task.taskInfo.stage = TaskState.TaskStage.STARTED;
+    protected void initializeState(ExampleTaskServiceState task, Operation taskOperation) {
         task.subStage = SubStage.QUERY_EXAMPLES;
 
         if (task.taskLifetime != null) {
@@ -204,7 +180,10 @@ public class ExampleTaskService extends StatefulService {
             task.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
                     + TimeUnit.SECONDS.toMicros(DEFAULT_TASK_LIFETIME);
         }
-        taskOperation.setBody(task);
+
+        // Do our task-specific logic... This will allow our ExampleTaskService's "default"
+        // expiration to take precedence over the default expiration set by TaskService
+        super.initializeState(task, taskOperation);
     }
 
     /**
@@ -223,7 +202,7 @@ public class ExampleTaskService extends StatefulService {
         if (!validateTransition(patch, currentTask, patchBody)) {
             return;
         }
-        updateState(patch, currentTask, patchBody);
+        updateState(currentTask, patchBody);
         patch.complete();
 
         switch (patchBody.taskInfo.stage) {
@@ -237,7 +216,7 @@ public class ExampleTaskService extends StatefulService {
             logInfo("Task canceled: not implemented, ignoring");
             break;
         case FINISHED:
-            logInfo("Task finished successfully");
+            logFine("Task finished successfully");
             break;
         case FAILED:
             logWarning("Task failed: %s", (patchBody.failureMessage == null ? "No reason given"
@@ -266,29 +245,14 @@ public class ExampleTaskService extends StatefulService {
     /**
      * Validate that the PATCH we got requests reasonanble changes to our state
      */
-    private boolean validateTransition(Operation patch, ExampleTaskServiceState currentTask,
+    protected boolean validateTransition(Operation patch, ExampleTaskServiceState currentTask,
             ExampleTaskServiceState patchBody) {
-        if (patchBody.taskInfo == null) {
-            patch.fail(new IllegalArgumentException("Missing taskInfo"));
-            return false;
-        }
-        if (patchBody.taskInfo.stage == null) {
-            patch.fail(new IllegalArgumentException("Missing stage"));
-            return false;
-        }
+        super.validateTransition(patch, currentTask, patchBody);
         if (patchBody.taskInfo.stage == TaskStage.STARTED && patchBody.subStage == null) {
             patch.fail(new IllegalArgumentException("Missing substage"));
             return false;
         }
-        if (patchBody.taskInfo.stage == TaskStage.CREATED) {
-            patch.fail(new IllegalArgumentException("Did not expect to receive CREATED stage"));
-            return false;
-        }
         if (currentTask.taskInfo != null && currentTask.taskInfo.stage != null) {
-            if (currentTask.taskInfo.stage.ordinal() > patchBody.taskInfo.stage.ordinal()) {
-                patch.fail(new IllegalArgumentException("Task stage cannot move backwards"));
-                return false;
-            }
             if (currentTask.taskInfo.stage == TaskStage.STARTED
                     && patchBody.taskInfo.stage == TaskStage.STARTED) {
                 if (currentTask.subStage.ordinal() > patchBody.subStage.ordinal()) {
@@ -302,23 +266,6 @@ public class ExampleTaskService extends StatefulService {
     }
 
     /**
-     * This updates the state of the task. Note that we are merging information from the
-     * PATCH into the current task. Because we are merging into the current task (it's the
-     * same object), we do not need to explicitly save the state: that will happen when
-     * we call patch.complete()
-     */
-    private void updateState(Operation patch,
-            ExampleTaskServiceState currentTask,
-            ExampleTaskServiceState patchBody) {
-        Utils.mergeWithState(getDocumentTemplate().documentDescription, currentTask, patchBody);
-
-        // Take the new document expiration time
-        if (currentTask.documentExpirationTimeMicros == 0) {
-            currentTask.documentExpirationTimeMicros = patchBody.documentExpirationTimeMicros;
-        }
-    }
-
-    /**
      * Handle SubStage QUERY_EXAMPLES.
      *
      * Query the query task service for all example services that we are authorized to access.
@@ -327,10 +274,16 @@ public class ExampleTaskService extends StatefulService {
     private void handleQueryExamples(ExampleTaskServiceState task) {
         // Create a query for "all documents with kind ==
         // com:vmware:xenon:services:common:ExampleService:ExampleServiceState"
-        Query exampleDocumentQuery = Query.Builder.create()
-                .setTerm(ServiceDocument.FIELD_NAME_KIND,
-                        Utils.buildKind(ExampleServiceState.class))
-                .build();
+        Query.Builder builder = Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class);
+
+        if (task.customQueryClause != null) {
+            // expand query with a specified field value, narrowing down the eligible
+            // services
+            builder.addClause((task.customQueryClause));
+        }
+
+        Query exampleDocumentQuery = builder.build();
         task.exampleQueryTask = QueryTask.Builder.createDirectTask()
                 .setQuery(exampleDocumentQuery)
                 .build();
@@ -354,7 +307,7 @@ public class ExampleTaskService extends StatefulService {
                             // We extract the result of the task because DELETE_EXAMPLES will use
                             // the list of documents found
                             task.exampleQueryTask = op.getBody(QueryTask.class);
-                            sendSelfPatch(task, TaskStage.STARTED, SubStage.DELETE_EXAMPLES);
+                            sendSelfPatch(task, TaskStage.STARTED, subStageSetter(SubStage.DELETE_EXAMPLES));
                         });
         sendRequest(queryRequest);
     }
@@ -376,8 +329,9 @@ public class ExampleTaskService extends StatefulService {
             return;
         }
         if (task.exampleQueryTask.results.documentLinks.size() == 0) {
-            logInfo("No example service documents found, nothing to do");
+            logFine("No example service documents found, nothing to do");
             sendSelfPatch(task, TaskStage.FINISHED, null);
+            return;
         }
 
         List<Operation> deleteOperations = new ArrayList<>();
@@ -403,41 +357,14 @@ public class ExampleTaskService extends StatefulService {
                 }).sendWith(this);
     }
 
-
     /**
-     * Send ourselves a PATCH that will indicate failure
+     * Helper method that returns a lambda that will set SubStage for us
+     * @param subStage the SubStage to use
+     *
+     * @return lambda helper needed for {@link TaskService#sendSelfPatch(TaskServiceState, TaskStage, Consumer)}
      */
-    private void sendSelfFailurePatch(ExampleTaskServiceState task, String failureMessage) {
-        task.failureMessage = failureMessage;
-        sendSelfPatch(task, TaskStage.FAILED, null);
+    private Consumer<ExampleTaskServiceState> subStageSetter(SubStage subStage) {
+        return taskState -> taskState.subStage = subStage;
     }
 
-    /**
-     * Send ourselves a PATCH that will advance to another step in the task workflow to the
-     * specified stage and substage.
-     */
-    private void sendSelfPatch(ExampleTaskServiceState task, TaskStage stage, SubStage subStage) {
-        if (task.taskInfo == null) {
-            task.taskInfo = new TaskState();
-        }
-        task.taskInfo.stage = stage;
-        task.subStage = subStage;
-        sendSelfPatch(task);
-    }
-
-    /**
-     * Send ourselves a PATCH. The caller is responsible for creating the PATCH body
-     */
-    private void sendSelfPatch(ExampleTaskServiceState task) {
-        Operation patch = Operation.createPatch(getUri())
-                .setBody(task)
-                .setCompletion(
-                        (op, ex) -> {
-                            if (ex != null) {
-                                logWarning("Failed to send patch, task has failed: %s",
-                                        ex.getMessage());
-                            }
-                        });
-        sendRequest(patch);
-    }
 }

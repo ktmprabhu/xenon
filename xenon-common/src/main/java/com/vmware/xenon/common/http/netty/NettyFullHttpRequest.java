@@ -68,16 +68,12 @@ public class NettyFullHttpRequest extends DefaultFullHttpRequest {
                 protocolVersion(),
                 method(),
                 uri(),
-                copyContent ? content().copy() :
-                    newContent == null ? Unpooled.buffer(0) : newContent);
+                copyContent ? content().copy()
+                        : newContent == null ? Unpooled.buffer(0) : newContent,
+                false);
         copy.headers().set(headers());
         copy.trailingHeaders().set(trailingHeaders());
         return copy;
-    }
-
-    @Override
-    public FullHttpRequest copy(ByteBuf newContent) {
-        return copy(false, newContent);
     }
 
     @Override
@@ -88,7 +84,7 @@ public class NettyFullHttpRequest extends DefaultFullHttpRequest {
     @Override
     public FullHttpRequest duplicate() {
         DefaultFullHttpRequest duplicate = new NettyFullHttpRequest(
-                protocolVersion(), method(), uri(), content().duplicate());
+                protocolVersion(), method(), uri(), content().duplicate(), false);
         duplicate.headers().set(headers());
         duplicate.trailingHeaders().set(trailingHeaders());
         return duplicate;

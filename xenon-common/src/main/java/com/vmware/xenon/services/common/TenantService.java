@@ -13,7 +13,11 @@
 
 package com.vmware.xenon.services.common;
 
+import java.util.UUID;
+
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
@@ -25,6 +29,12 @@ import com.vmware.xenon.common.StatefulService;
  * a unique identifier is generated during creation.
  */
 public class TenantService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/tenants";
+
+    public static Service createFactory() {
+        return FactoryService.createIdempotent(TenantService.class);
+    }
+
     public static class TenantState extends ServiceDocument {
         /**
          * Unique identifier for the tenant. If not specified during creation, a random one is automatically set.
@@ -55,6 +65,19 @@ public class TenantService extends StatefulService {
     }
 
     @Override
+    public void handleStart(Operation post) {
+        if (!post.hasBody()) {
+            post.fail(new IllegalArgumentException("body is required"));
+            return;
+        }
+        TenantState newState = post.getBody(TenantState.class);
+        if (newState.id == null || newState.id.isEmpty()) {
+            newState.id = UUID.randomUUID().toString();
+        }
+        post.setBody(newState).complete();
+    }
+
+    @Override
     public void handlePut(Operation op) {
         if (!op.hasBody()) {
             op.fail(new IllegalArgumentException("body is required"));
@@ -63,7 +86,7 @@ public class TenantService extends StatefulService {
 
         TenantState newState = op.getBody(TenantState.class);
         TenantState currentState = getState(op);
-        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
             op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
         } else {

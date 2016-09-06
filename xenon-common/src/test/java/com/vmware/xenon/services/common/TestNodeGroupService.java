@@ -14,6 +14,7 @@
 package com.vmware.xenon.services.common;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
@@ -24,10 +25,12 @@ import java.util.Date;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -39,18 +42,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import com.vmware.xenon.common.AuthorizationSetupHelper;
 import com.vmware.xenon.common.CommandLineArgumentParser;
 import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.NodeSelectorService.SelectAndForwardRequest;
 import com.vmware.xenon.common.NodeSelectorService.SelectOwnerResponse;
 import com.vmware.xenon.common.NodeSelectorState;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.OperationJoin;
 import com.vmware.xenon.common.Service;
@@ -58,6 +66,7 @@ import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.Service.ProcessingStage;
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceConfigUpdateRequest;
+import com.vmware.xenon.common.ServiceConfiguration;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.ServiceDocumentQueryResult;
@@ -67,6 +76,7 @@ import com.vmware.xenon.common.ServiceHost.ServiceHostState;
 import com.vmware.xenon.common.ServiceStats;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.StatefulService;
+import com.vmware.xenon.common.TaskState;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.common.test.AuthorizationHelper;
@@ -75,23 +85,43 @@ import com.vmware.xenon.common.test.RoundRobinIterator;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.TestProperty;
 import com.vmware.xenon.common.test.VerificationHost;
+import com.vmware.xenon.common.test.VerificationHost.WaitHandler;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.ExampleTaskService.ExampleTaskServiceState;
 import com.vmware.xenon.services.common.MinimalTestService.MinimalTestServiceErrorResponse;
 import com.vmware.xenon.services.common.NodeGroupService.JoinPeerRequest;
 import com.vmware.xenon.services.common.NodeGroupService.NodeGroupConfig;
 import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
 import com.vmware.xenon.services.common.NodeState.NodeOption;
 import com.vmware.xenon.services.common.QueryTask.Query;
+import com.vmware.xenon.services.common.QueryTask.Query.Builder;
 import com.vmware.xenon.services.common.QueryTask.QueryTerm.MatchType;
 import com.vmware.xenon.services.common.ReplicationTestService.ReplicationTestServiceErrorResponse;
 import com.vmware.xenon.services.common.ReplicationTestService.ReplicationTestServiceState;
+import com.vmware.xenon.services.common.ResourceGroupService.ResourceGroupState;
 import com.vmware.xenon.services.common.RoleService.RoleState;
+import com.vmware.xenon.services.common.UserService.UserState;
 
 public class TestNodeGroupService {
 
-    public static class CustomNodeGroupService extends StatefulService {
+    public static class PeriodicExampleFactoryService extends FactoryService {
+        public static final String SELF_LINK = "test/examples-periodic";
 
-        public CustomNodeGroupService() {
+        public PeriodicExampleFactoryService() {
+            super(ExampleServiceState.class);
+        }
+
+        @Override
+        public Service createServiceInstance() throws Throwable {
+            ExampleService s = new ExampleService();
+            s.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
+            return s;
+        }
+    }
+
+    public static class ExampleServiceWithCustomSelector extends StatefulService {
+
+        public ExampleServiceWithCustomSelector() {
             super(ExampleServiceState.class);
             super.toggleOption(ServiceOption.REPLICATION, true);
             super.toggleOption(ServiceOption.OWNER_SELECTION, true);
@@ -100,20 +130,21 @@ public class TestNodeGroupService {
 
     }
 
-    public static class CustomNodeGroupFactoryService extends FactoryService {
+    public static class ExampleFactoryServiceWithCustomSelector extends FactoryService {
 
-        public CustomNodeGroupFactoryService() {
+        public ExampleFactoryServiceWithCustomSelector() {
             super(ExampleServiceState.class);
             super.setPeerNodeSelectorPath(CUSTOM_GROUP_NODE_SELECTOR);
         }
 
         @Override
         public Service createServiceInstance() throws Throwable {
-            return new CustomNodeGroupService();
+            return new ExampleServiceWithCustomSelector();
         }
 
     }
 
+    private static final String CUSTOM_EXAMPLE_SERVICE_KIND = "xenon:examplestate";
     private static final String CUSTOM_NODE_GROUP_NAME = "custom";
     private static final String CUSTOM_NODE_GROUP = UriUtils.buildUriPath(
             ServiceUriPaths.NODE_GROUP_FACTORY,
@@ -151,6 +182,16 @@ public class TestNodeGroupService {
      */
     public long testDurationSeconds;
 
+    /**
+     * Command line argument specifying iterations per test method
+     */
+    public long iterationCount = 1;
+
+    /**
+     * Command line argument used by replication long running tests
+     */
+    public long totalOperationLimit = Long.MAX_VALUE;
+
     private NodeGroupConfig nodeGroupConfig = new NodeGroupConfig();
     private EnumSet<ServiceOption> postCreationServiceOptions = EnumSet.noneOf(ServiceOption.class);
     private boolean expectFailure;
@@ -165,6 +206,10 @@ public class TestNodeGroupService {
         if (current.name == null) {
             return false;
         }
+        if (!this.host.isRemotePeerTest() &&
+                !CUSTOM_EXAMPLE_SERVICE_KIND.equals(current.documentKind)) {
+            return false;
+        }
         return current.name.equals(initial.name);
     };
 
@@ -177,6 +222,7 @@ public class TestNodeGroupService {
     private boolean isPeerSynchronizationEnabled = true;
     private boolean isAuthorizationEnabled = false;
     private HttpScheme replicationUriScheme;
+    private boolean skipAvailabilityChecks = false;
 
     private void setUp(int localHostCount) throws Throwable {
         if (this.host != null) {
@@ -186,12 +232,21 @@ public class TestNodeGroupService {
         this.host = VerificationHost.create(0);
         this.host.setAuthorizationEnabled(this.isAuthorizationEnabled);
 
-        VerificationHost.createAndAttachSSLClient(this.host, null, null);
+        VerificationHost.createAndAttachSSLClient(this.host);
 
         if (this.replicationUriScheme == HttpScheme.HTTPS_ONLY) {
             // disable HTTP, forcing host.getPublicUri() to return a HTTPS schemed URI. This in
             // turn forces the node group to use HTTPS for join, replication, etc
             this.host.setPort(ServiceHost.PORT_VALUE_LISTENER_DISABLED);
+            // the default is disable (-1) so we must set port to 0, to enable SSL and make the
+            // runtime pick a random HTTPS port
+            this.host.setSecurePort(0);
+        }
+
+        if (this.testDurationSeconds > 0) {
+            // for long running tests use the default interval to match production code
+            this.host.maintenanceIntervalMillis = TimeUnit.MICROSECONDS.toMillis(
+                    ServiceHostState.DEFAULT_MAINTENANCE_INTERVAL_MICROS);
         }
 
         this.host.start();
@@ -207,6 +262,13 @@ public class TestNodeGroupService {
 
         for (VerificationHost h1 : this.host.getInProcessHostMap().values()) {
             setUpPeerHostWithAdditionalServices(h1);
+        }
+
+        // If the peer hosts are remote, then we undo CUSTOM_EXAMPLE_SERVICE_KIND
+        // from the KINDS cache and use the real documentKind of ExampleService.
+        if (this.host.isRemotePeerTest()) {
+            Utils.registerKind(ExampleServiceState.class,
+                    Utils.toDocumentKind(ExampleServiceState.class));
         }
     }
 
@@ -255,10 +317,13 @@ public class TestNodeGroupService {
     @Before
     public void setUp() {
         CommandLineArgumentParser.parseFromProperties(this);
+        Utils.registerKind(ExampleServiceState.class, CUSTOM_EXAMPLE_SERVICE_KIND);
     }
 
     @After
     public void tearDown() throws InterruptedException {
+        Utils.registerKind(ExampleServiceState.class,
+                Utils.toDocumentKind(ExampleServiceState.class));
         if (this.host == null) {
             return;
         }
@@ -312,7 +377,6 @@ public class TestNodeGroupService {
             nodeA.initialize(args);
             nodeA.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS
                     .toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
-            nodeA.setOperationTimeOutMicros(nodeA.getMaintenanceIntervalMicros() * 5);
             nodeA.start();
 
             // verify we see a specific retry stat
@@ -335,8 +399,119 @@ public class TestNodeGroupService {
         }
     }
 
+    @Ignore("https://www.pivotaltracker.com/story/show/129681537")
+    @Test
+    public void verifyOdlServiceSynchronization() throws Throwable {
+        // Setup peer nodes
+        setUp(this.nodeCount);
+
+        EnumSet<ServiceOption> caps = EnumSet.of(
+                ServiceOption.PERSISTENCE,
+                ServiceOption.REPLICATION,
+                ServiceOption.OWNER_SELECTION,
+                ServiceOption.INSTRUMENTATION);
+
+        long intervalMicros = TimeUnit.MILLISECONDS.toMicros(200);
+
+        // Start the ODL Factory service on all the peers.
+        for (VerificationHost h : this.host.getInProcessHostMap().values()) {
+            // Reduce the maintenance interval and cache clear delay to short durations
+            // to cause ODL service stops.
+            h.setMaintenanceIntervalMicros(intervalMicros);
+            h.setServiceCacheClearDelayMicros(intervalMicros);
+
+            // create an on demand load factory and services
+            this.host.testStart(1);
+            OnDemandLoadFactoryService s = new OnDemandLoadFactoryService();
+            s.setChildServiceCaps(caps);
+            Operation factoryPost = Operation
+                    .createPost(UriUtils.buildUri(h, OnDemandLoadFactoryService.class))
+                    .setCompletion(this.host.getCompletion());
+            h.startService(factoryPost, s);
+            this.host.testWait();
+        }
+
+        // join the nodes and set full quorum.
+        this.host.joinNodesAndVerifyConvergence(this.host.getPeerCount());
+        this.host.setNodeGroupQuorum(this.nodeCount);
+        this.host.waitForNodeGroupConvergence(this.nodeCount);
+
+        waitForReplicatedFactoryServiceAvailable(
+                this.host.getPeerServiceUri(OnDemandLoadFactoryService.SELF_LINK),
+                this.replicationNodeSelector);
+
+        // Create a few child-services.
+        VerificationHost h = this.host.getPeerHost();
+        Map<URI, ExampleServiceState> childServices = this.host.doFactoryChildServiceStart(
+                null,
+                this.serviceCount,
+                ExampleServiceState.class,
+                (o) -> {
+                    ExampleServiceState initialState = new ExampleServiceState();
+                    initialState.name = UUID.randomUUID().toString();
+                    o.setBody(initialState);
+                },
+                UriUtils.buildFactoryUri(h, OnDemandLoadFactoryService.class));
+
+        // Verify that each peer host reports the correct value for ODL stop count.
+        for (VerificationHost vh : this.host.getInProcessHostMap().values()) {
+            this.host.waitFor("ODL services did not stop as expected",
+                    () -> checkOdlServiceStopCount(vh, this.serviceCount));
+        }
+
+        // Add a new host to the cluster.
+        VerificationHost newHost = this.host.setUpLocalPeerHost(0, h.maintenanceIntervalMillis,
+                null);
+        newHost.setServiceCacheClearDelayMicros(intervalMicros);
+        this.host.testStart(1);
+        OnDemandLoadFactoryService s = new OnDemandLoadFactoryService();
+        s.setChildServiceCaps(caps);
+        Operation factoryPost = Operation
+                .createPost(UriUtils.buildUri(newHost, s.getClass()))
+                .setCompletion(this.host.getCompletion());
+        newHost.startService(factoryPost, s);
+        this.host.testWait();
+        this.host.joinNodesAndVerifyConvergence(this.nodeCount + 1);
+
+        // Do GETs on each previously created child services by calling the newly added host.
+        // This will trigger synchronization for the child services.
+        this.host.log(Level.INFO, "Verifying synchronization for ODL services");
+        for (Entry<URI, ExampleServiceState> childService : childServices.entrySet()) {
+            String childServicePath = childService.getKey().getPath();
+            ExampleServiceState state = this.host.getServiceState(null,
+                    ExampleServiceState.class, UriUtils.buildUri(newHost, childServicePath));
+            assertNotNull(state);
+        }
+
+        // Verify that the new peer host reports the correct value for ODL stop count.
+        this.host.waitFor("ODL services did not stop as expected",
+                () -> checkOdlServiceStopCount(newHost, this.serviceCount));
+    }
+
+    private boolean checkOdlServiceStopCount(VerificationHost host, int serviceCount)
+            throws Throwable {
+        ServiceStat stopCount = host
+                .getServiceStats(host.getManagementServiceUri())
+                .get(ServiceHostManagementService.STAT_NAME_ODL_STOP_COUNT);
+        if (stopCount == null || stopCount.latestValue != serviceCount) {
+            this.host.log(Level.INFO,
+                    "Current stopCount is %s",
+                    (stopCount != null) ? String.valueOf(stopCount.latestValue) : "null");
+            return false;
+        }
+        return true;
+    }
+
     @Test
     public void customNodeGroupWithObservers() throws Throwable {
+        for (int i = 0; i < this.iterationCount; i++) {
+            Logger.getAnonymousLogger().info("Iteration: " + i);
+            verifyCustomNodeGroupWithObservers();
+            tearDown();
+        }
+    }
+
+    private void verifyCustomNodeGroupWithObservers() throws Throwable {
         setUp(this.nodeCount);
         // on one of the hosts create the custom group but with self as an observer. That peer should
         // never receive replicated or broadcast requests
@@ -360,15 +535,21 @@ public class TestNodeGroupService {
             h.startServiceAndWait(new ConsistentHashingNodeSelectorService(),
                     CUSTOM_GROUP_NODE_SELECTOR, initialState);
             // start the factory that is attached to the custom group selector
-            h.startServiceAndWait(CustomNodeGroupFactoryService.class, customFactoryLink);
+            h.startServiceAndWait(ExampleFactoryServiceWithCustomSelector.class, customFactoryLink);
         }
 
+        URI customNodeGroupServiceOnObserver = UriUtils
+                .buildUri(observerHostUri, CUSTOM_NODE_GROUP);
         Map<URI, EnumSet<NodeOption>> expectedOptionsPerNode = new HashMap<>();
-        expectedOptionsPerNode.put(UriUtils.buildUri(observerHostUri, CUSTOM_NODE_GROUP),
+        expectedOptionsPerNode.put(customNodeGroupServiceOnObserver,
                 observerSelfState.options);
 
         this.host.joinNodesAndVerifyConvergence(CUSTOM_NODE_GROUP, this.nodeCount,
                 this.nodeCount, expectedOptionsPerNode);
+        // one of the nodes is observer, so we must set quorum to 2 explicitly
+        this.host.setNodeGroupQuorum(2, customNodeGroupServiceOnObserver);
+        this.host.waitForNodeSelectorQuorumConvergence(CUSTOM_GROUP_NODE_SELECTOR, 2);
+        this.host.waitForNodeGroupIsAvailableConvergence(CUSTOM_NODE_GROUP);
 
         int restartCount = 0;
         // verify that the observer node shows up as OBSERVER on all peers, including self
@@ -400,6 +581,9 @@ public class TestNodeGroupService {
         this.host.joinNodesAndVerifyConvergence(this.nodeCount, true);
 
         URI observerFactoryUri = UriUtils.buildUri(observerHostUri, customFactoryLink);
+
+        waitForReplicatedFactoryServiceAvailable(observerFactoryUri, CUSTOM_GROUP_NODE_SELECTOR);
+
         // create N services on the custom group, verify none of them got created on the observer.
         // We actually post directly to the observer node, which should forward to the other nodes
         Map<URI, ExampleServiceState> serviceStatesOnPost = this.host.doFactoryChildServiceStart(
@@ -427,7 +611,7 @@ public class TestNodeGroupService {
 
         URI existingNodeGroup = this.host.getPeerNodeGroupUri();
 
-        // start  more nodes, insert them to existing group, but with no synchronization required
+        // start more nodes, insert them to existing group, but with no synchronization required
         // start some additional nodes
         int additionalHostCount = this.nodeCount;
         List<ServiceHost> newHosts = Collections.synchronizedList(new ArrayList<>());
@@ -481,22 +665,84 @@ public class TestNodeGroupService {
     }
 
     @Test
-    public void synchronizationOneByOne() throws Throwable {
+    public void verifyGossipForObservers() throws Throwable {
         setUp(this.nodeCount);
+
+        Iterator<Entry<URI, URI>> nodeGroupIterator = this.host.getNodeGroupMap().entrySet()
+                .iterator();
+        URI observerUri = nodeGroupIterator.next().getKey();
+        String observerId = this.host.getServiceState(null,
+                ServiceHostState.class,
+                UriUtils.buildUri(observerUri, ServiceUriPaths.CORE_MANAGEMENT)).id;
+
+        // Create a custom node group. Mark one node as OBSERVER and rest as PEER
+        Map<URI, NodeState> selfStatePerNode = new HashMap<>();
+        NodeState observerSelfState = new NodeState();
+        observerSelfState.id = observerId;
+        observerSelfState.options = EnumSet.of(NodeOption.OBSERVER);
+        selfStatePerNode.put(observerUri, observerSelfState);
+        this.host.createCustomNodeGroupOnPeers(CUSTOM_NODE_GROUP_NAME, selfStatePerNode);
+
+        // Pick a PEER and join it to each node in the node-group
+        URI peerUri = nodeGroupIterator.next().getKey();
+        URI peerCustomUri = UriUtils.buildUri(peerUri, CUSTOM_NODE_GROUP);
+
+        Map<URI, EnumSet<NodeOption>> expectedOptionsPerNode = new HashMap<>();
+        Set<URI> customNodeUris = new HashSet<>();
+
+        for (Entry<URI, URI> node : this.host.getNodeGroupMap().entrySet()) {
+            URI nodeUri = node.getKey();
+            URI nodeCustomUri = UriUtils.buildUri(nodeUri, CUSTOM_NODE_GROUP);
+
+            JoinPeerRequest request = new JoinPeerRequest();
+            request.memberGroupReference = nodeCustomUri;
+            TestContext ctx = this.host.testCreate(1);
+            Operation post = Operation
+                    .createPost(peerCustomUri)
+                    .setBody(request)
+                    .setReferer(this.host.getReferer())
+                    .setCompletion(ctx.getCompletion());
+            this.host.sendRequest(post);
+            ctx.await();
+
+            expectedOptionsPerNode.put(nodeCustomUri,
+                    EnumSet.of((nodeUri == observerUri)
+                            ? NodeOption.OBSERVER : NodeOption.PEER));
+            customNodeUris.add(nodeCustomUri);
+        }
+
+        // Verify that gossip will propagate the single OBSERVER and the PEER nodes
+        // to every node in the custom node-group.
+        this.host.waitForNodeGroupConvergence(
+                customNodeUris, this.nodeCount, this.nodeCount, expectedOptionsPerNode, false);
+    }
+
+    @Test
+    public void synchronizationOneByOneWithAbruptNodeShutdown() throws Throwable {
+        setUp(this.nodeCount);
+
+        this.replicationTargetFactoryLink = PeriodicExampleFactoryService.SELF_LINK;
+        // start the periodic example service factory on each node
+        for (VerificationHost h : this.host.getInProcessHostMap().values()) {
+            h.startServiceAndWait(PeriodicExampleFactoryService.class,
+                    PeriodicExampleFactoryService.SELF_LINK);
+        }
 
         // On one host, add some services. They exist only on this host and we expect them to synchronize
         // across all hosts once this one joins with the group
-        URI hostUriWithInitialState = this.host.getPeerHostUri();
-        Map<String, ExampleServiceState> exampleStatesPerSelfLink =
-                createExampleServices(hostUriWithInitialState);
+        VerificationHost initialHost = this.host.getPeerHost();
+        URI hostUriWithInitialState = initialHost.getUri();
+        Map<String, ExampleServiceState> exampleStatesPerSelfLink = createExampleServices(
+                hostUriWithInitialState);
 
         URI hostWithStateNodeGroup = UriUtils.buildUri(hostUriWithInitialState,
                 ServiceUriPaths.DEFAULT_NODE_GROUP);
 
         // before start joins, verify isolated factory synchronization is done
         for (URI hostUri : this.host.getNodeGroupMap().keySet()) {
-            this.host.waitForServiceAvailable(UriUtils.buildUri(hostUri,
-                    ExampleService.FACTORY_LINK));
+            waitForReplicatedFactoryServiceAvailable(
+                    UriUtils.buildUri(hostUri, this.replicationTargetFactoryLink),
+                    ServiceUriPaths.DEFAULT_NODE_SELECTOR);
         }
 
         // join a node, with no state, one by one, to the host with state.
@@ -509,7 +755,7 @@ public class TestNodeGroupService {
         List<URI> joinedHosts = new ArrayList<>();
         Map<URI, URI> factories = new HashMap<>();
         factories.put(hostWithStateNodeGroup, UriUtils.buildUri(hostWithStateNodeGroup,
-                ExampleService.FACTORY_LINK));
+                this.replicationTargetFactoryLink));
         joinedHosts.add(hostWithStateNodeGroup);
         int fullQuorum = 1;
 
@@ -530,7 +776,7 @@ public class TestNodeGroupService {
             this.host.testWait();
             joinedHosts.add(nodeGroupUri);
             factories.put(nodeGroupUri, UriUtils.buildUri(nodeGroupUri,
-                    ExampleService.FACTORY_LINK));
+                    this.replicationTargetFactoryLink));
             this.host.waitForNodeGroupConvergence(joinedHosts, fullQuorum, fullQuorum, true);
             this.host.waitForNodeGroupIsAvailableConvergence(nodeGroupUri.getPath(), joinedHosts);
 
@@ -540,13 +786,18 @@ public class TestNodeGroupService {
                     this.exampleStateConvergenceChecker, exampleStatesPerSelfLink.size(),
                     0);
 
+            // Do updates, which will verify that the services are converged in terms of ownership.
+            // Since we also synchronize on demand, if there was any discrepancy, after updates, the
+            // services will converge
             doExampleServicePatch(exampleStatesPerSelfLink,
                     joinedHosts.get(0));
 
+            Set<String> ownerIds = this.host.getNodeStateMap().keySet();
+            verifyDocumentOwnerAndEpoch(exampleStatesPerSelfLink, initialHost, joinedHosts, 0, 1,
+                    ownerIds.size() - 1);
         }
 
         doNodeStopWithUpdates(exampleStatesPerSelfLink);
-
     }
 
     private void doExampleServicePatch(Map<String, ExampleServiceState> states,
@@ -554,6 +805,9 @@ public class TestNodeGroupService {
         this.host.log("Starting PATCH to %d example services", states.size());
         TestContext ctx = this.host
                 .testCreate(this.updateCount * states.size());
+
+        this.setOperationTimeoutMicros(TimeUnit.SECONDS.toMicros(this.host.getTimeoutSeconds()));
+
         for (int i = 0; i < this.updateCount; i++) {
             for (Entry<String, ExampleServiceState> e : states.entrySet()) {
                 ExampleServiceState st = Utils.clone(e.getValue());
@@ -565,28 +819,122 @@ public class TestNodeGroupService {
                 this.host.send(patch);
             }
         }
-        ctx.await();
+        this.host.testWait(ctx);
+        this.host.log("Done with PATCH to %d example services", states.size());
     }
 
-    private void doNodeStopWithUpdates(Map<String, ExampleServiceState> exampleStatesPerSelfLink)
+    public void doNodeStopWithUpdates(Map<String, ExampleServiceState> exampleStatesPerSelfLink)
             throws Throwable {
+        this.host.log("Starting to stop nodes and send updates");
         VerificationHost remainingHost = this.host.getPeerHost();
         Collection<VerificationHost> hostsToStop = new ArrayList<>(this.host.getInProcessHostMap()
                 .values());
         hostsToStop.remove(remainingHost);
         List<URI> targetServices = new ArrayList<>();
         for (String link : exampleStatesPerSelfLink.keySet()) {
+            // build the URIs using the host we plan to keep, so the maps we use below to lookup
+            // stats from URIs, work before and after node stop
             targetServices.add(UriUtils.buildUri(remainingHost, link));
         }
 
+        for (VerificationHost h : this.host.getInProcessHostMap().values()) {
+            h.setPeerSynchronizationTimeLimitSeconds(this.host.getTimeoutSeconds() / 3);
+        }
+
+        // capture current stats from each service
+        Map<URI, ServiceStats> prevStats = verifyMaintStatsAfterSynchronization(targetServices,
+                null);
+
         stopHostsAndVerifyQueuing(hostsToStop, remainingHost, targetServices);
+
+        // its important to verify document ownership before we do any updates on the services.
+        // This is because we verify, that even without any on demand synchronization,
+        // the factory driven synchronization set the services in the proper state
+        Set<String> ownerIds = this.host.getNodeStateMap().keySet();
+        List<URI> remainingHosts = new ArrayList<>(this.host.getNodeGroupMap().keySet());
+        verifyDocumentOwnerAndEpoch(exampleStatesPerSelfLink,
+                this.host.getInProcessHostMap().values().iterator().next(),
+                remainingHosts, 0, 1,
+                ownerIds.size() - 1);
+
+        // confirm maintenance is back up and running on all services
+        verifyMaintStatsAfterSynchronization(targetServices, prevStats);
 
         // nodes are stopped, do updates again, quorum is relaxed, they should work
         doExampleServicePatch(exampleStatesPerSelfLink, remainingHost.getUri());
+
+        this.host.log("Done with stop nodes and send updates");
+    }
+
+    private void verifyDynamicMaintOptionToggle(Map<String, ExampleServiceState> childStates) {
+
+        List<URI> targetServices = new ArrayList<>();
+        childStates.keySet().forEach((l) -> targetServices.add(this.host.getPeerServiceUri(l)));
+
+        List<URI> targetServiceStats = new ArrayList<>();
+        List<URI> targetServiceConfig = new ArrayList<>();
+        for (URI child : targetServices) {
+            targetServiceStats.add(UriUtils.buildStatsUri(child));
+            targetServiceConfig.add(UriUtils.buildConfigUri(child));
+        }
+
+        Map<URI, ServiceConfiguration> configPerService = this.host.getServiceState(
+                null, ServiceConfiguration.class, targetServiceConfig);
+        for (ServiceConfiguration cfg : configPerService.values()) {
+            assertTrue(!cfg.options.contains(ServiceOption.PERIODIC_MAINTENANCE));
+        }
+
+        for (URI child : targetServices) {
+            this.host.toggleServiceOptions(child,
+                    EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE),
+                    null);
+        }
+
+        verifyMaintStatsAfterSynchronization(targetServices, null);
+    }
+
+    private Map<URI, ServiceStats> verifyMaintStatsAfterSynchronization(List<URI> targetServices,
+            Map<URI, ServiceStats> statsPerService) {
+
+        List<URI> targetServiceStats = new ArrayList<>();
+        List<URI> targetServiceConfig = new ArrayList<>();
+        for (URI child : targetServices) {
+            targetServiceStats.add(UriUtils.buildStatsUri(child));
+            targetServiceConfig.add(UriUtils.buildConfigUri(child));
+        }
+
+        if (statsPerService == null) {
+            statsPerService = new HashMap<>();
+        }
+        final Map<URI, ServiceStats> previousStatsPerService = statsPerService;
+        this.host.waitFor(
+                "maintenance not enabled",
+                () -> {
+                    Map<URI, ServiceStats> stats = this.host.getServiceState(null,
+                            ServiceStats.class, targetServiceStats);
+                    for (Entry<URI, ServiceStats> currentEntry : stats.entrySet()) {
+                        ServiceStats previousStats = previousStatsPerService.get(currentEntry
+                                .getKey());
+                        ServiceStats currentStats = currentEntry.getValue();
+                        ServiceStat previousMaintStat = previousStats == null ? new ServiceStat()
+                                : previousStats.entries
+                                .get(Service.STAT_NAME_MAINTENANCE_COUNT);
+                        double previousValue = previousMaintStat == null ? 0L
+                                : previousMaintStat.latestValue;
+                        ServiceStat maintStat = currentStats.entries
+                                .get(Service.STAT_NAME_MAINTENANCE_COUNT);
+                        if (maintStat == null || maintStat.latestValue <= previousValue) {
+                            return false;
+                        }
+                    }
+                    previousStatsPerService.putAll(stats);
+                    return true;
+                });
+        return statsPerService;
     }
 
     private Map<String, ExampleServiceState> createExampleServices(URI hostUri) throws Throwable {
-        URI factoryUri = UriUtils.buildUri(hostUri, ExampleService.FACTORY_LINK);
+        URI factoryUri = UriUtils.buildUri(hostUri, this.replicationTargetFactoryLink);
         this.host.log("POSTing children to %s", hostUri);
 
         // add some services on one of the peers, so we can verify the get synchronized after they all join
@@ -679,7 +1027,7 @@ public class TestNodeGroupService {
             // now start a new Host and supply the already created peer, then observe the automatic
             // join
             h = new ExampleServiceHost();
-            int quorum = this.host.getPeerCount();
+            int quorum = this.host.getPeerCount() + 1;
 
             String mainHostId = "main-" + VerificationHost.hostNumber.incrementAndGet();
             String[] args = {
@@ -709,11 +1057,15 @@ public class TestNodeGroupService {
             this.host.setNodeGroupQuorum(quorum, mainHostNodeGroupUri);
             this.host.setNodeGroupQuorum(quorum);
 
-            this.host.scheduleSynchronizationIfAutoSyncDisabled();
+            this.host.scheduleSynchronizationIfAutoSyncDisabled(this.replicationNodeSelector);
 
             int peerNodeCount = h.getInitialPeerHosts().size();
             // include self in peers
             assertTrue(totalCount >= peerNodeCount + 1);
+
+            // Before factory synch is complete, make sure POSTs to existing services fail,
+            // since they are not marked idempotent.
+            verifyReplicatedInConflictPost(dupStates);
 
             // now verify all nodes synchronize and see the example service instances that existed on the single
             // host
@@ -729,11 +1081,10 @@ public class TestNodeGroupService {
                     this.exampleStateConvergenceChecker,
                     exampleStatesPerSelfLink);
 
-            for (VerificationHost peer : this.host.getInProcessHostMap().values()) {
-                verifyFactoryAvailable(UriUtils.buildFactoryUri(peer, ExampleService.class));
-            }
-
-            verifyFactoryAvailable(UriUtils.buildFactoryUri(h, ExampleService.class));
+            URI exampleFactoryUri = this.host.getPeerServiceUri(ExampleService.FACTORY_LINK);
+            waitForReplicatedFactoryServiceAvailable(
+                    UriUtils.buildUri(exampleFactoryUri, ExampleService.FACTORY_LINK),
+                    ServiceUriPaths.DEFAULT_NODE_SELECTOR);
         } finally {
             this.host.log("test finished");
             if (h != null) {
@@ -741,6 +1092,84 @@ public class TestNodeGroupService {
                 tmpFolder.delete();
             }
         }
+    }
+
+    private void verifyReplicatedInConflictPost(Map<URI, ExampleServiceState> dupStates)
+            throws Throwable {
+        // Its impossible to guarantee that this runs during factory synch. It might run before,
+        // it might run during, it might run after. Since we runs 1000s of tests per day, CI
+        // will let us know if the production code works. Here, we add a small sleep so we increase
+        // chance we overlap with factory synchronization.
+        Thread.sleep(TimeUnit.MICROSECONDS.toMillis(
+                this.host.getPeerHost().getMaintenanceIntervalMicros()));
+        // Issue a POST for a service we know exists and expect failure, since the example service
+        // is not marked IDEMPOTENT. We expect CONFLICT error code, but if synchronization is active
+        // we want to confirm we dont get 500, but the 409 is preserved
+        TestContext ctx = this.host.testCreate(dupStates.size());
+        for (ExampleServiceState st : dupStates.values()) {
+            URI factoryUri = this.host.getPeerServiceUri(ExampleService.FACTORY_LINK);
+            Operation post = Operation.createPost(factoryUri).setBody(st)
+                    .setCompletion((o, e) -> {
+                        if (e != null) {
+                            if (o.getStatusCode() != Operation.STATUS_CODE_CONFLICT) {
+                                ctx.failIteration(new IllegalStateException(
+                                        "Expected conflict status, got " + o.getStatusCode()));
+                                return;
+                            }
+                            ctx.completeIteration();
+                            return;
+                        }
+                        ctx.failIteration(new IllegalStateException(
+                                "Expected failure on duplicate POST"));
+                    });
+            this.host.send(post);
+        }
+        this.host.testWait(ctx);
+    }
+
+    @Test
+    public void replicationWithQuorumAfterAbruptNodeStop()
+            throws Throwable {
+        // we need at least 5 nodes, because we're going to stop 2
+        // nodes and we need majority quorum
+        this.nodeCount = Math.max(5, this.nodeCount);
+        int hostStopCount = 2;
+
+        // TODO disable automatic synchronization until
+        // https://www.pivotaltracker.com/story/show/126248293 is fixed
+        this.isPeerSynchronizationEnabled = false;
+        this.skipAvailabilityChecks = true;
+
+        if (this.host == null) {
+            // create node group, join nodes and set majority quorum
+            setUp(this.nodeCount);
+            this.host.joinNodesAndVerifyConvergence(this.host.getPeerCount());
+            this.host.setNodeGroupQuorum(this.host.getPeerCount() / 2 + 1);
+        }
+
+        // create some documents
+        Map<String, ExampleServiceState> childStates = doExampleFactoryPostReplicationTest(
+                this.serviceCount, null, null);
+        updateExampleServiceOptions(childStates);
+
+        // stop minority number of hosts - quorum is still intact
+        int i = 0;
+        for (Entry<URI, VerificationHost> e : this.host.getInProcessHostMap().entrySet()) {
+            this.expectedFailedHosts.add(e.getKey());
+            this.host.stopHost(e.getValue());
+            if (++i >= hostStopCount) {
+                break;
+            }
+        }
+
+        // do some updates with strong quorum enabled
+        int expectedVersion = this.updateCount;
+        childStates = doStateUpdateReplicationTest(Action.PATCH, this.serviceCount,
+                this.updateCount,
+                expectedVersion,
+                this.exampleStateUpdateBodySetter,
+                this.exampleStateConvergenceChecker,
+                childStates);
     }
 
     /**
@@ -804,7 +1233,7 @@ public class TestNodeGroupService {
         int hostRestartCount = 2;
 
         Map<String, ExampleServiceState> childStates = doExampleFactoryPostReplicationTest(
-                this.serviceCount, null);
+                this.serviceCount, null, null);
 
         updateExampleServiceOptions(childStates);
 
@@ -822,6 +1251,10 @@ public class TestNodeGroupService {
                 this.exampleStateUpdateBodySetter,
                 this.exampleStateConvergenceChecker,
                 childStates);
+
+        long now = Utils.getNowMicrosUtc();
+
+        validatePerOperationReplicationQuorum(childStates, now);
 
         // expect failure, since we will stop some hosts, break quorum
         this.expectFailure = true;
@@ -874,6 +1307,63 @@ public class TestNodeGroupService {
                 childStates);
     }
 
+    private void validatePerOperationReplicationQuorum(Map<String, ExampleServiceState> childStates,
+            long now) throws Throwable {
+        Random r = new Random();
+        // issue a patch, with per operation quorum set, verify it applied
+        for (Entry<String, ExampleServiceState> e : childStates.entrySet()) {
+            TestContext ctx = this.host.testCreate(1);
+            ExampleServiceState body = e.getValue();
+            body.counter = now;
+            Operation patch = Operation.createPatch(this.host.getPeerServiceUri(e.getKey()))
+                    .setCompletion(ctx.getCompletion())
+                    .setBody(body);
+
+            // add an explicit replication count header, using either the "all" value, or an
+            // explicit node count
+            if (r.nextBoolean()) {
+                patch.addRequestHeader(Operation.REPLICATION_QUORUM_HEADER,
+                        Operation.REPLICATION_QUORUM_HEADER_VALUE_ALL);
+            } else {
+                patch.addRequestHeader(Operation.REPLICATION_QUORUM_HEADER,
+                        this.nodeCount + "");
+            }
+
+            this.host.send(patch);
+            this.host.testWait(ctx);
+            // Go to each peer, directly to their index, and verify update is present. This is not
+            // proof the per operation quorum was applied "synchronously", before the response
+            // was sent, but over many runs, if there is a race or its applied asynchronously,
+            // we will see failures
+            for (URI hostBaseUri : this.host.getNodeGroupMap().keySet()) {
+                URI indexUri = UriUtils.buildUri(hostBaseUri, ServiceUriPaths.CORE_DOCUMENT_INDEX);
+                indexUri = UriUtils.buildIndexQueryUri(indexUri,
+                        e.getKey(), true, false, ServiceOption.PERSISTENCE);
+
+                ExampleServiceState afterState = this.host.getServiceState(null,
+                        ExampleServiceState.class, indexUri);
+                assertEquals(body.counter, afterState.counter);
+            }
+        }
+
+        this.host.toggleNegativeTestMode(true);
+        // verify that if we try to set per operation quorum too high, request will fail
+        for (Entry<String, ExampleServiceState> e : childStates.entrySet()) {
+            TestContext ctx = this.host.testCreate(1);
+            ExampleServiceState body = e.getValue();
+            body.counter = now;
+            Operation patch = Operation.createPatch(this.host.getPeerServiceUri(e.getKey()))
+                    .addRequestHeader(Operation.REPLICATION_QUORUM_HEADER,
+                            (this.nodeCount * 2) + "")
+                    .setCompletion(ctx.getExpectedFailureCompletion())
+                    .setBody(body);
+            this.host.send(patch);
+            this.host.testWait(ctx);
+            break;
+        }
+        this.host.toggleNegativeTestMode(false);
+    }
+
     private void setOperationTimeoutMicros(long opTimeoutMicros) {
         for (VerificationHost h : this.host.getInProcessHostMap().values()) {
             h.setOperationTimeOutMicros(opTimeoutMicros);
@@ -910,8 +1400,8 @@ public class TestNodeGroupService {
 
         factoryUri = UriUtils.buildUri(hostUri,
                 ReplicationFactoryTestService.OWNER_SELECTION_SELF_LINK);
-        Map<URI, ReplicationTestServiceState> ownerSelectedServices =
-                doReplicatedServiceFactoryPost(this.serviceCount, setBodyCallback, factoryUri);
+        Map<URI, ReplicationTestServiceState> ownerSelectedServices = doReplicatedServiceFactoryPost(
+                this.serviceCount, setBodyCallback, factoryUri);
 
         factoryUri = UriUtils.buildUri(hostUri, ReplicationFactoryTestService.STRICT_SELF_LINK);
         doReplicatedServiceFactoryPost(this.serviceCount, setBodyCallback, factoryUri);
@@ -1074,7 +1564,7 @@ public class TestNodeGroupService {
         this.host.log("Inducing synchronization");
         // Induce synchronization on stable node group. No changes should be observed since
         // all nodes should have identical state
-        this.host.scheduleSynchronizationIfAutoSyncDisabled();
+        this.host.scheduleSynchronizationIfAutoSyncDisabled(this.replicationNodeSelector);
         // give synchronization a chance to run, its 100% asynchronous so we can't really tell when each
         // child is done, but a small delay should be sufficient for 99.9% of test environments, even under
         // load
@@ -1212,7 +1702,7 @@ public class TestNodeGroupService {
     @Test
     public void replicationLimitedFactor() throws Throwable {
         this.replicationFactor = 3L;
-        this.replicationNodeSelector = ServiceUriPaths.SHA1_3X_NODE_SELECTOR;
+        this.replicationNodeSelector = ServiceUriPaths.DEFAULT_3X_NODE_SELECTOR;
         this.replicationTargetFactoryLink = LimitedReplicationExampleFactoryService.SELF_LINK;
         this.nodeCount = Math.max(5, this.nodeCount);
         doReplication();
@@ -1227,7 +1717,11 @@ public class TestNodeGroupService {
                     + TimeUnit.SECONDS.toMillis(this.testDurationSeconds));
         }
 
+        Map<Action, Long> elapsedTimePerAction = new HashMap<>();
+        Map<Action, Long> countPerAction = new HashMap<>();
+
         long totalOperations = 0;
+        int iterationCount = 0;
         do {
             if (this.host == null) {
                 setUp(this.nodeCount);
@@ -1236,22 +1730,36 @@ public class TestNodeGroupService {
                 // the limited replication selector to use the minimum between majority of replication
                 // factor, versus node group membership quorum
                 this.host.setNodeGroupQuorum(this.nodeCount);
+                // since we have disabled peer synch, trigger it explicitly so factories become available
+                this.host.scheduleSynchronizationIfAutoSyncDisabled(this.replicationNodeSelector);
+
+                waitForReplicatedFactoryServiceAvailable(
+                        this.host.getPeerServiceUri(this.replicationTargetFactoryLink),
+                        this.replicationNodeSelector);
+
+                waitForReplicationFactoryConvergence();
+                if (this.replicationUriScheme == ServiceHost.HttpScheme.HTTPS_ONLY) {
+                    // confirm nodes are joined using HTTPS group references
+                    for (URI nodeGroup : this.host.getNodeGroupMap().values()) {
+                        assertTrue(UriUtils.HTTPS_SCHEME.equals(nodeGroup.getScheme()));
+                    }
+                }
+
             }
 
             Map<String, ExampleServiceState> childStates = doExampleFactoryPostReplicationTest(
-                    this.serviceCount);
+                    this.serviceCount, countPerAction, elapsedTimePerAction);
             totalOperations += this.serviceCount;
 
-            // verify IDEMPOTENT POST conversion to PUT, with replication
-            TestContext ctx = this.host.testCreate(childStates.size());
-            for (Entry<String, ExampleServiceState> entry : childStates.entrySet()) {
-                Operation post = Operation
-                        .createPost(this.host.getPeerServiceUri(ExampleService.FACTORY_LINK))
-                        .setBody(entry.getValue())
-                        .setCompletion(ctx.getCompletion());
-                this.host.send(post);
+            if (this.testDurationSeconds == 0) {
+                // various validation tests, executed just once, ignored in long running test
+                this.host.doExampleServiceUpdateAndQueryByVersion(this.host.getPeerHostUri(),
+                        this.serviceCount);
+                verifyReplicatedForcedPostAfterDelete(childStates);
+                verifyInstantNotFoundFailureOnBadLinks();
+                verifyReplicatedIdempotentPost(childStates);
+                verifyDynamicMaintOptionToggle(childStates);
             }
-            ctx.await();
 
             totalOperations += this.serviceCount;
 
@@ -1261,32 +1769,34 @@ public class TestNodeGroupService {
             int expectedVersion = this.updateCount;
 
             if (!this.host.isStressTest()
-                    && (this.host.getPeerCount() > 16 || this.serviceCount * this.updateCount > 100)) {
+                    && (this.host.getPeerCount() > 16
+                            || this.serviceCount * this.updateCount > 100)) {
                 this.host.setStressTest(true);
             }
 
-            if (this.testDurationSeconds == 0 && this.serviceCount < 100) {
-                doMissingServiceUpdatesNoQueuing();
-            }
-
+            long opCount = this.serviceCount * this.updateCount;
             childStates = doStateUpdateReplicationTest(Action.PATCH, this.serviceCount,
                     this.updateCount,
                     expectedVersion,
                     this.exampleStateUpdateBodySetter,
                     this.exampleStateConvergenceChecker,
-                    childStates);
+                    childStates,
+                    countPerAction,
+                    elapsedTimePerAction);
             expectedVersion += this.updateCount;
 
-            totalOperations += this.serviceCount * this.updateCount;
+            totalOperations += opCount;
 
             childStates = doStateUpdateReplicationTest(Action.PUT, this.serviceCount,
                     this.updateCount,
                     expectedVersion,
                     this.exampleStateUpdateBodySetter,
                     this.exampleStateConvergenceChecker,
-                    childStates);
+                    childStates,
+                    countPerAction,
+                    elapsedTimePerAction);
 
-            totalOperations += this.serviceCount * this.updateCount;
+            totalOperations += opCount;
 
             Date queryExp = this.host.getTestExpiration();
             if (expiration.after(queryExp)) {
@@ -1313,15 +1823,175 @@ public class TestNodeGroupService {
                     expectedVersion,
                     this.exampleStateUpdateBodySetter,
                     this.exampleStateConvergenceChecker,
-                    childStates);
+                    childStates,
+                    countPerAction,
+                    elapsedTimePerAction);
 
-            totalOperations += this.serviceCount * this.updateCount;
+            totalOperations += this.serviceCount;
 
-            this.host.log("Total operations: %d", totalOperations);
+            // compute the binary serialized payload, and the JSON payload size
+            ExampleServiceState st = childStates.values().iterator().next();
+            String json = Utils.toJson(st);
+            int byteCount = Utils.toDocumentBytes(st, new byte[4096], 0);
+            int jsonByteCount = json.getBytes(Utils.CHARSET).length;
+            // estimate total bytes transferred between nodes. The owner receives JSON from the client
+            // but then uses binary serialization to the N-1 replicas
+            long totalBytes = jsonByteCount * totalOperations
+                    + (this.nodeCount - 1) * byteCount * totalOperations;
 
-        } while (new Date().before(expiration));
+            this.host.log(
+                    "Bytes per json:%d, per binary: %d, Total operations: %d, Total bytes:%d",
+                    jsonByteCount,
+                    byteCount,
+                    totalOperations,
+                    totalBytes);
+
+            if (++iterationCount < 2 && this.testDurationSeconds > 0) {
+                // ignore data during JVM warm-up, first two iterations
+                countPerAction.clear();
+                elapsedTimePerAction.clear();
+            }
+
+        } while (new Date().before(expiration) && this.totalOperationLimit > totalOperations);
+
+        logPerActionThroughput(elapsedTimePerAction, countPerAction);
 
         this.host.doNodeGroupStatsVerification(this.host.getNodeGroupMap());
+    }
+
+    private void logPerActionThroughput(Map<Action, Long> elapsedTimePerAction,
+            Map<Action, Long> countPerAction) {
+        for (Action a : EnumSet.allOf(Action.class)) {
+            Long count = countPerAction.get(a);
+            if (count == null) {
+                continue;
+            }
+            Long elapsedMicros = elapsedTimePerAction.get(a);
+
+            double thpt = (count * 1.0) / (1.0 * elapsedMicros);
+            thpt *= 1000000;
+            this.host.log("Total ops for %s: %d, Throughput (ops/sec): %f", a, count, thpt);
+        }
+    }
+
+    private void updatePerfDataPerAction(Action a, Long startTime, Long opCount,
+            Map<Action, Long> countPerAction, Map<Action, Long> elapsedTime) {
+        if (opCount == null || countPerAction != null) {
+            countPerAction.merge(a, opCount, (e, n) -> {
+                if (e == null) {
+                    return n;
+                }
+                return e + n;
+            });
+        }
+
+        if (startTime == null || elapsedTime == null) {
+            return;
+        }
+
+        long delta = Utils.getNowMicrosUtc() - startTime;
+        elapsedTime.merge(a, delta, (e, n) -> {
+            if (e == null) {
+                return n;
+            }
+            return e + n;
+        });
+    }
+
+    private void verifyReplicatedIdempotentPost(Map<String, ExampleServiceState> childStates)
+            throws Throwable {
+        // verify IDEMPOTENT POST conversion to PUT, with replication
+        // Since the factory is not idempotent by default, enable the option dynamically
+        Map<URI, URI> exampleFactoryUris = this.host
+                .getNodeGroupToFactoryMap(ExampleService.FACTORY_LINK);
+        for (URI factoryUri : exampleFactoryUris.values()) {
+            this.host.toggleServiceOptions(factoryUri,
+                    EnumSet.of(ServiceOption.IDEMPOTENT_POST), null);
+        }
+        TestContext ctx = this.host.testCreate(childStates.size());
+        for (Entry<String, ExampleServiceState> entry : childStates.entrySet()) {
+            Operation post = Operation
+                    .createPost(this.host.getPeerServiceUri(ExampleService.FACTORY_LINK))
+                    .setBody(entry.getValue())
+                    .setCompletion(ctx.getCompletion());
+            this.host.send(post);
+        }
+        ctx.await();
+    }
+
+    /**
+     * Verifies that DELETE actions propagate and commit, and, that forced POST actions succeed
+     */
+    private void verifyReplicatedForcedPostAfterDelete(Map<String, ExampleServiceState> childStates)
+            throws Throwable {
+        // delete one of the children, then re-create but with a zero version, using a special
+        // directive that forces creation
+        Entry<String, ExampleServiceState> childEntry = childStates.entrySet().iterator().next();
+        TestContext ctx = this.host.testCreate(1);
+        Operation delete = Operation
+                .createDelete(this.host.getPeerServiceUri(childEntry.getKey()))
+                .setCompletion(ctx.getCompletion());
+        this.host.send(delete);
+        ctx.await();
+
+        if (!this.host.isRemotePeerTest()) {
+            this.host.waitFor("services not deleted", () -> {
+                for (VerificationHost h : this.host.getInProcessHostMap().values()) {
+                    ProcessingStage stg = h.getServiceStage(childEntry.getKey());
+                    if (stg != null) {
+                        this.host.log("Service exists %s on host %s, stage %s",
+                                childEntry.getKey(), h.toString(), stg);
+                        return false;
+                    }
+                }
+                return true;
+            });
+        }
+
+        TestContext postCtx = this.host.testCreate(1);
+        Operation opPost = Operation
+                .createPost(this.host.getPeerServiceUri(this.replicationTargetFactoryLink))
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
+                .setBody(childEntry.getValue())
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        postCtx.failIteration(e);
+                    } else {
+                        postCtx.completeIteration();
+                    }
+                });
+        this.host.send(opPost);
+        this.host.testWait(postCtx);
+    }
+
+    private void waitForReplicationFactoryConvergence() throws Throwable {
+
+        // for code coverage, verify the convenience method on the host also reports available
+        WaitHandler wh = () -> {
+            TestContext ctx = this.host.testCreate(1);
+            boolean[] isReady = new boolean[1];
+            CompletionHandler ch = (o, e) -> {
+                if (e != null) {
+                    isReady[0] = false;
+                } else {
+                    isReady[0] = true;
+                }
+                ctx.completeIteration();
+            };
+
+            VerificationHost peerHost = this.host.getPeerHost();
+            if (peerHost == null) {
+                NodeGroupUtils.checkServiceAvailability(ch, this.host,
+                        this.host.getPeerServiceUri(this.replicationTargetFactoryLink),
+                        this.replicationNodeSelector);
+            } else {
+                peerHost.checkReplicatedServiceAvailable(ch, this.replicationTargetFactoryLink);
+            }
+            ctx.await();
+            return isReady[0];
+        };
+
+        this.host.waitFor("available check timeout for " + this.replicationTargetFactoryLink, wh);
     }
 
     private Set<String> verifyReplicatedServiceCountWithBroadcastQueries()
@@ -1365,30 +2035,30 @@ public class TestNodeGroupService {
                             }
 
                             // verify broadcast requests should come from all discrete nodes
-                        Set<String> ownerIds = new HashSet<>();
+                            Set<String> ownerIds = new HashSet<>();
 
-                        for (Entry<URI, String> en : rsp.jsonResponses.entrySet()) {
-                            String jsonRsp = en.getValue();
-                            QueryTask qt = Utils.fromJson(jsonRsp, QueryTask.class);
-                            this.host.log("Broadcast response from %s %s", qt.documentSelfLink,
-                                    qt.documentOwner);
-                            ownerIds.add(qt.documentOwner);
-                            if (qt.results == null) {
-                                this.host.log("Node %s had no results", en.getKey());
-                                continue;
+                            for (Entry<URI, String> en : rsp.jsonResponses.entrySet()) {
+                                String jsonRsp = en.getValue();
+                                QueryTask qt = Utils.fromJson(jsonRsp, QueryTask.class);
+                                this.host.log("Broadcast response from %s %s", qt.documentSelfLink,
+                                        qt.documentOwner);
+                                ownerIds.add(qt.documentOwner);
+                                if (qt.results == null) {
+                                    this.host.log("Node %s had no results", en.getKey());
+                                    continue;
+                                }
+                                for (String l : qt.results.documentLinks) {
+                                    links.add(l);
+                                }
                             }
-                            for (String l : qt.results.documentLinks) {
-                                links.add(l);
-                            }
-                        }
 
-                        if (ownerIds.size() != rsp.jsonResponses.size()) {
-                            throw new IllegalStateException(
-                                    "Number of owners in response less than node count: " +
-                                            ownerIds.toString());
-                        }
-                        this.host.completeIteration();
-                    });
+                            if (ownerIds.size() != rsp.jsonResponses.size()) {
+                                throw new IllegalStateException(
+                                        "Number of owners in response less than node count: " +
+                                                ownerIds.toString());
+                            }
+                            this.host.completeIteration();
+                        });
 
         this.host.send(postQuery);
         this.host.testWait();
@@ -1396,18 +2066,36 @@ public class TestNodeGroupService {
         return links;
     }
 
-    private void doMissingServiceUpdatesNoQueuing() throws Throwable {
+    private void verifyInstantNotFoundFailureOnBadLinks() throws Throwable {
         this.host.toggleNegativeTestMode(true);
+
+        CompletionHandler c = (o, e) -> {
+            if (e != null) {
+                this.host.completeIteration();
+                return;
+            }
+            // strange, service exists, lets verify
+            for (VerificationHost h : this.host.getInProcessHostMap().values()) {
+                ProcessingStage stg = h.getServiceStage(o.getUri().getPath());
+                if (stg != null) {
+                    this.host.log("Service exists %s on host %s, stage %s",
+                            o.getUri().getPath(), h.toString(), stg);
+                }
+            }
+            this.host.failIteration(new Throwable("Expected service to not exist:"
+                    + o.toString()));
+        };
+
         // do a negative test: send request to a example child we know does not exist, but disable queuing
         // so we get 404 right away
         this.host.testStart(this.serviceCount);
         for (int i = 0; i < this.serviceCount; i++) {
             URI factoryURI = this.host.getNodeGroupToFactoryMap(ExampleService.FACTORY_LINK)
                     .values().iterator().next();
-            URI bogusChild = UriUtils.extendUri(factoryURI, UUID.randomUUID().toString());
+            URI bogusChild = UriUtils.extendUri(factoryURI,
+                    Utils.getNowMicrosUtc() + UUID.randomUUID().toString());
             Operation patch = Operation.createPatch(bogusChild)
-                    .setCompletion(this.host.getExpectedFailureCompletion())
-                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_QUEUING)
+                    .setCompletion(c)
                     .setBody(new ExampleServiceState());
 
             this.host.send(patch);
@@ -1425,6 +2113,252 @@ public class TestNodeGroupService {
         factorySynchronizationNoChildren();
 
         factoryDuplicatePost();
+    }
+
+    @Test
+    public void replicationWithAuthzCacheClear() throws Throwable {
+        this.isAuthorizationEnabled = true;
+        setUp(this.nodeCount);
+        this.host.joinNodesAndVerifyConvergence(this.nodeCount);
+        this.host.setNodeGroupQuorum(this.nodeCount);
+
+        VerificationHost groupHost = this.host.getPeerHost();
+
+        // wait for auth related services to be stabilized
+        groupHost.waitForReplicatedFactoryServiceAvailable(
+                UriUtils.buildUri(groupHost, UserService.FACTORY_LINK));
+        groupHost.waitForReplicatedFactoryServiceAvailable(
+                UriUtils.buildUri(groupHost, UserGroupService.FACTORY_LINK));
+        groupHost.waitForReplicatedFactoryServiceAvailable(
+                UriUtils.buildUri(groupHost, ResourceGroupService.FACTORY_LINK));
+        groupHost.waitForReplicatedFactoryServiceAvailable(
+                UriUtils.buildUri(groupHost, RoleService.FACTORY_LINK));
+
+        String fooUserLink = "/core/authz/users/foo@vmware.com";
+        String barUserLink = "/core/authz/users/bar@vmware.com";
+        String bazUserLink = "/core/authz/users/baz@vmware.com";
+
+        groupHost.setSystemAuthorizationContext();
+
+        // create user, user-group, resource-group, role for foo@vmware.com
+        //   user: /core/authz/users/foo@vmware.com
+        //   user-group: /core/authz/user-groups/foo-user-group
+        //   resource-group:  (not important)
+        //   role: /core/authz/role/foo-role-1
+        TestContext testContext = this.host.testCreate(1);
+        AuthorizationSetupHelper.create()
+                .setHost(groupHost)
+                .setUserSelfLink("foo@vmware.com")
+                .setUserEmail("foo@vmware.com")
+                .setUserPassword("password")
+                .setDocumentKind(Utils.buildKind(ExampleServiceState.class))
+                .setUserGroupName("foo-user-group")
+                .setRoleName("foo-role-1")
+                .setCompletion(ex -> {
+                    if (ex == null) {
+                        testContext.completeIteration();
+                    } else {
+                        testContext.failIteration(ex);
+                    }
+                })
+                .start();
+        testContext.await();
+
+        // create another user-group, resource-group, and role for foo@vmware.com
+        //   user-group: (not important)
+        //   resource-group:  (not important)
+        //   role: /core/authz/role/foo-role-2
+        TestContext ctxToCreateAnotherRole = this.host.testCreate(1);
+        AuthorizationSetupHelper.create()
+                .setHost(groupHost)
+                .setUserSelfLink(fooUserLink)
+                .setDocumentKind(Utils.buildKind(ExampleServiceState.class))
+                .setRoleName("foo-role-2")
+                .setCompletion(ex -> {
+                    if (ex == null) {
+                        ctxToCreateAnotherRole.completeIteration();
+                    } else {
+                        ctxToCreateAnotherRole.failIteration(ex);
+                    }
+                })
+                .setupRole();
+        ctxToCreateAnotherRole.await();
+
+        // create user, user-group, resource-group, role for bar@vmware.com
+        //   user: /core/authz/users/bar@vmware.com
+        //   user-group: (not important)
+        //   resource-group:  (not important)
+        //   role: (not important)
+        TestContext ctxToCreateBar = this.host.testCreate(1);
+        AuthorizationSetupHelper.create()
+                .setHost(groupHost)
+                .setUserSelfLink("bar@vmware.com")
+                .setUserEmail("bar@vmware.com")
+                .setUserPassword("password")
+                .setDocumentKind(Utils.buildKind(ExampleServiceState.class))
+                .setCompletion(ex -> {
+                    if (ex == null) {
+                        ctxToCreateBar.completeIteration();
+                    } else {
+                        ctxToCreateBar.failIteration(ex);
+                    }
+                })
+                .start();
+        ctxToCreateBar.await();
+
+        // create user, user-group, resource-group, role for baz@vmware.com
+        //   user: /core/authz/users/baz@vmware.com
+        //   user-group: (not important)
+        //   resource-group:  (not important)
+        //   role: (not important)
+        TestContext ctxToCreateBaz = this.host.testCreate(1);
+        AuthorizationSetupHelper.create()
+                .setHost(groupHost)
+                .setUserSelfLink("baz@vmware.com")
+                .setUserEmail("baz@vmware.com")
+                .setUserPassword("password")
+                .setDocumentKind(Utils.buildKind(ExampleServiceState.class))
+                .setCompletion(ex -> {
+                    if (ex == null) {
+                        ctxToCreateBaz.completeIteration();
+                    } else {
+                        ctxToCreateBaz.failIteration(ex);
+                    }
+                })
+                .start();
+        ctxToCreateBaz.await();
+
+        AuthorizationContext fooAuthContext = groupHost.assumeIdentity(fooUserLink);
+        AuthorizationContext barAuthContext = groupHost.assumeIdentity(barUserLink);
+        AuthorizationContext bazAuthContext = groupHost.assumeIdentity(bazUserLink);
+        String fooToken = fooAuthContext.getToken();
+        String barToken = barAuthContext.getToken();
+        String bazToken = bazAuthContext.getToken();
+
+        groupHost.resetSystemAuthorizationContext();
+
+        // verify deleting role should clear the auth cache
+        populateAuthCacheInPeer(fooAuthContext);
+        groupHost.setSystemAuthorizationContext();
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createDelete(
+                        UriUtils.buildUri(groupHost, "/core/authz/roles/foo-role-1")));
+        groupHost.resetSystemAuthorizationContext();
+        verifyAuthCacheHasClearedInPeers(fooToken);
+
+        // verify deleting user-group should clear the auth cache
+        populateAuthCacheInPeer(fooAuthContext);
+        // delete the user group associated with the user
+        groupHost.setSystemAuthorizationContext();
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createDelete(
+                        UriUtils.buildUri(groupHost, "/core/authz/user-groups/foo-user-group")));
+        groupHost.resetSystemAuthorizationContext();
+        verifyAuthCacheHasClearedInPeers(fooToken);
+
+        // verify creating new role should clear the auth cache (using bar@vmware.com)
+        populateAuthCacheInPeer(barAuthContext);
+        groupHost.setSystemAuthorizationContext();
+        Query q = Builder.create()
+                .addFieldClause(
+                        ExampleServiceState.FIELD_NAME_KIND,
+                        Utils.buildKind(ExampleServiceState.class))
+                .build();
+        TestContext ctxToCreateAnotherRoleForBar = this.host.testCreate(1);
+        AuthorizationSetupHelper.create()
+                .setHost(groupHost)
+                .setUserSelfLink(barUserLink)
+                .setResourceGroupName("/core/authz/resource-groups/new-rg")
+                .setResourceQuery(q)
+                .setRoleName("bar-role-2")
+                .setCompletion(ex -> {
+                    if (ex == null) {
+                        ctxToCreateAnotherRoleForBar.completeIteration();
+                    } else {
+                        ctxToCreateAnotherRoleForBar.failIteration(ex);
+                    }
+                })
+                .setupRole();
+        ctxToCreateAnotherRoleForBar.await();
+        groupHost.resetSystemAuthorizationContext();
+
+        verifyAuthCacheHasClearedInPeers(barToken);
+
+        //
+        populateAuthCacheInPeer(barAuthContext);
+        groupHost.setSystemAuthorizationContext();
+
+        // Updating the resource group should be able to handle the fact that the user group does not exist
+        String newResourceGroupLink = "/core/authz/resource-groups/new-rg";
+        Query updateResourceGroupQuery = Builder.create()
+                .addFieldClause(ExampleServiceState.FIELD_NAME_NAME, "bar")
+                .build();
+        ResourceGroupState resourceGroupState = new ResourceGroupState();
+        resourceGroupState.query = updateResourceGroupQuery;
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createPut(UriUtils.buildUri(groupHost, newResourceGroupLink))
+                        .setBody(resourceGroupState));
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createDelete(UriUtils.buildUri(groupHost, newResourceGroupLink)));
+        groupHost.resetSystemAuthorizationContext();
+        verifyAuthCacheHasClearedInPeers(barToken);
+
+        // verify patching user should clear the auth cache
+        populateAuthCacheInPeer(fooAuthContext);
+        groupHost.setSystemAuthorizationContext();
+        UserState userState = new UserState();
+        userState.userGroupLinks = new HashSet<>();
+        userState.userGroupLinks.add("foo");
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createPatch(UriUtils.buildUri(groupHost, fooUserLink))
+                        .setBody(userState));
+        groupHost.resetSystemAuthorizationContext();
+        verifyAuthCacheHasClearedInPeers(fooToken);
+
+        // verify deleting user should clear the auth cache
+        populateAuthCacheInPeer(bazAuthContext);
+        groupHost.setSystemAuthorizationContext();
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createDelete(UriUtils.buildUri(groupHost, bazUserLink)));
+        groupHost.resetSystemAuthorizationContext();
+        verifyAuthCacheHasClearedInPeers(bazToken);
+
+    }
+
+    private void populateAuthCacheInPeer(AuthorizationContext authContext) throws Throwable {
+        VerificationHost groupHost = this.host.getPeerHost();
+
+        // issue GET to populate authContext in one of the peer
+        groupHost.setAuthorizationContext(authContext);
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createGet(UriUtils.buildUri(groupHost, ExampleService.FACTORY_LINK)));
+
+        this.host.waitFor("Timeout waiting for correct auth cache state",
+                () -> checkCache(authContext.getToken(), true));
+    }
+
+    private void verifyAuthCacheHasClearedInPeers(String userToken) throws Throwable {
+        this.host.waitFor("Timeout waiting for correct auth cache state",
+                () -> checkCache(userToken, false));
+    }
+
+    private boolean checkCache(String token, boolean expectEntries) throws Throwable {
+        boolean contextFound = false;
+        for (VerificationHost peer : this.host.getInProcessHostMap().values()) {
+            peer.setSystemAuthorizationContext();
+            MinimalTestService s = new MinimalTestService();
+            peer.addPrivilegedService(MinimalTestService.class);
+            peer.startServiceAndWait(s, UUID.randomUUID().toString(), null);
+            peer.resetSystemAuthorizationContext();
+            if (peer.getAuthorizationContext(s, token) != null) {
+                contextFound = true;
+                break;
+            }
+        }
+        if ((expectEntries && contextFound) || (!expectEntries && !contextFound)) {
+            return true;
+        }
+        return false;
     }
 
     private void factoryDuplicatePost() throws Throwable, InterruptedException, TimeoutException {
@@ -1488,21 +2422,18 @@ public class TestNodeGroupService {
 
     @Test
     public void forwardingAndSelection() throws Throwable {
+        this.isPeerSynchronizationEnabled = false;
         setUp(this.nodeCount);
         this.host.joinNodesAndVerifyConvergence(this.nodeCount);
-        forwardingToPeerId();
-
-        directOwnerSelection();
-
-        forwardingToKeyHashNode();
-
-        broadcast();
+        for (int i = 0; i < this.iterationCount; i++) {
+            directOwnerSelection();
+            forwardingToPeerId();
+            forwardingToKeyHashNode();
+            broadcast();
+        }
     }
 
-    private void broadcast() throws Throwable {
-        setUp(this.nodeCount);
-        this.host.joinNodesAndVerifyConvergence(this.nodeCount);
-
+    public void broadcast() throws Throwable {
         // Do a broadcast on a local, non replicated service. Replicated services can not
         // be used with broadcast since they will duplicate the update and potentially route
         // to a single node
@@ -1563,7 +2494,7 @@ public class TestNodeGroupService {
         }
     }
 
-    private void forwardingToKeyHashNode() throws Throwable {
+    public void forwardingToKeyHashNode() throws Throwable {
         long c = this.updateCount * this.nodeCount;
         Map<String, List<String>> ownersPerServiceLink = new HashMap<>();
 
@@ -1671,11 +2602,8 @@ public class TestNodeGroupService {
         }
     }
 
-    private void forwardingToPeerId() throws Throwable {
-
+    public void forwardingToPeerId() throws Throwable {
         long c = this.updateCount * this.nodeCount;
-        Map<String, URI> nodeIdToServiceURI = new HashMap<>();
-
         // 0) Create N service instances, in each peer host. Services are NOT replicated
         // 1) issue a forward request to a specific peer id, per service link
         // 2) verify the request ended up on the peer we targeted
@@ -1689,6 +2617,10 @@ public class TestNodeGroupService {
         this.host.testStart(c * this.host.getPeerCount());
         for (VerificationHost peer : this.host.getInProcessHostMap().values()) {
             for (ServiceDocument s : initialStates) {
+                s = Utils.clone(s);
+                // set the owner to be the target node. we will use this to verify it matches
+                // the id in the state, which is set through a forwarded PATCH
+                s.documentOwner = peer.getId();
                 Operation post = Operation.createPost(UriUtils.buildUri(peer, s.documentSelfLink))
                         .setCompletion(this.host.getCompletion())
                         .setBody(s);
@@ -1705,20 +2637,12 @@ public class TestNodeGroupService {
         UUID id = UUID.randomUUID();
         String headerRequestValue = "request-" + id;
         String headerResponseValue = "response-" + id;
-        List<ServiceDocument> documentsRemaining = new ArrayList<>(initialStates);
-        this.host.testStart(documentsRemaining.size());
-        while (!documentsRemaining.isEmpty()) {
-            // round robin the service documents between the peers
+        this.host.testStart(initialStates.size() * this.nodeCount);
+        for (ServiceDocument s : initialStates) {
+            // send a PATCH the id for each document, to each peer. If it routes to the proper peer
+            // the initial state.documentOwner, will match the state.id
 
             for (VerificationHost peer : this.host.getInProcessHostMap().values()) {
-                if (documentsRemaining.isEmpty()) {
-                    break;
-                }
-
-                ServiceDocument s = documentsRemaining.remove(0);
-                // Create a URI for the service instance we expect the PUT to land on: It will be
-                // on the peer we forward to, not the peer we forward *through*
-                URI serviceUri = UriUtils.buildUri(peer.getUri(), s.documentSelfLink);
                 // For testing coverage, force the use of the same forwarding service instance.
                 // We make all request flow from one peer to others, testing both loopback p2p
                 // and true forwarding. Otherwise, the forwarding happens by directly contacting
@@ -1734,7 +2658,6 @@ public class TestNodeGroupService {
                         .buildMinimalTestState();
                 body.id = peer.getId();
 
-                nodeIdToServiceURI.put(peer.getId(), serviceUri);
                 this.host.send(Operation.createPut(u)
                         .addRequestHeader(headerName, headerRequestValue)
                         .setCompletion(
@@ -1756,19 +2679,31 @@ public class TestNodeGroupService {
         }
         this.host.testWait();
         this.host.logThroughput();
-        Map<URI, MinimalTestServiceState> states = this.host.getServiceState(null,
-                MinimalTestServiceState.class, nodeIdToServiceURI.values());
-        for (MinimalTestServiceState s : states.values()) {
-            NodeState ns = this.host.getNodeStateMap().get(s.id);
-            if (ns == null) {
-                throw new IllegalStateException("host id not valid for " + s.documentSelfLink);
-            }
-            URI expectedServiceUri = nodeIdToServiceURI.get(s.id);
-            if (expectedServiceUri == null
-                    || !expectedServiceUri.getPath().equals(s.documentSelfLink)) {
-                throw new IllegalStateException("host id not valid for " + s.documentSelfLink);
+
+        TestContext ctx = this.host.testCreate(c * this.host.getPeerCount());
+        for (VerificationHost peer : this.host.getInProcessHostMap().values()) {
+            for (ServiceDocument s : initialStates) {
+                Operation get = Operation.createGet(UriUtils.buildUri(peer, s.documentSelfLink))
+                        .setCompletion(
+                                (o, e) -> {
+                                    if (e != null) {
+                                        ctx.failIteration(e);
+                                        return;
+                                    }
+                                    MinimalTestServiceState rsp = o
+                                            .getBody(MinimalTestServiceState.class);
+                                    if (!rsp.id.equals(rsp.documentOwner)) {
+                                        ctx.failIteration(
+                                                new IllegalStateException("Expected: "
+                                                        + rsp.documentOwner + " was: " + rsp.id));
+                                    } else {
+                                        ctx.completeIteration();
+                                    }
+                                });
+                this.host.send(get);
             }
         }
+        this.host.testWait(ctx);
 
         // Do a negative test: Send a request that will induce failure in the service handler and
         // make sure we receive back failure, with a ServiceErrorResponse body
@@ -1808,7 +2743,8 @@ public class TestNodeGroupService {
                                     return;
                                 }
                                 this.host.completeIteration();
-                            }).setBody(body));
+                            })
+                    .setBody(body));
         }
         this.host.testWait();
         this.host.toggleDebuggingMode(false);
@@ -1816,19 +2752,21 @@ public class TestNodeGroupService {
 
     private void directOwnerSelection() throws Throwable {
         Map<URI, Map<String, Long>> keyToNodeAssignmentsPerNode = new HashMap<>();
-        Set<String> keys = new HashSet<>();
+        List<String> keys = new ArrayList<>();
 
         long c = this.updateCount * this.nodeCount;
         // generate N keys once, then ask each node to assign to its peers. Each node should come up
         // with the same distribution
 
         for (int i = 0; i < c; i++) {
-            keys.add(UUID.randomUUID().toString());
+            keys.add(Utils.getNowMicrosUtc() + "");
         }
 
         for (URI nodeGroup : this.host.getNodeGroupMap().values()) {
             keyToNodeAssignmentsPerNode.put(nodeGroup, new HashMap<>());
         }
+
+        this.host.waitForNodeGroupConvergence(this.nodeCount);
 
         this.host.testStart(c * this.nodeCount);
         for (URI nodeGroup : this.host.getNodeGroupMap().values()) {
@@ -1871,14 +2809,19 @@ public class TestNodeGroupService {
             if (countPerNode == null) {
                 countPerNode = assignmentsPerNode;
             }
+
+            this.host.log("Node group %s assignments: %s", nodeGroup, assignmentsPerNode);
+
             for (Entry<String, Long> e : assignmentsPerNode.entrySet()) {
                 // we assume that with random keys, and random node ids, each node will get at least
                 // one key.
                 assertTrue(e.getValue() > 0);
-                this.host.log("Node group %s assigned node id %s %d keys", nodeGroup, e.getKey(),
-                        e.getValue());
-
-                if (!countPerNode.get(e.getKey()).equals(e.getValue())) {
+                Long count = countPerNode.get(e.getKey());
+                if (count == null) {
+                    continue;
+                }
+                if (!count.equals(e.getValue())) {
+                    this.host.logNodeGroupState();
                     throw new IllegalStateException(
                             "Node id got assigned the same key different number of times, on one of the nodes");
                 }
@@ -1897,20 +2840,20 @@ public class TestNodeGroupService {
         authHelper = new AuthorizationHelper(this.host);
 
         // relax quorum to allow for divergent writes, on independent nodes (not yet joined)
-        this.host.setNodeGroupQuorum(1);
+
         this.host.setSystemAuthorizationContext();
 
         // Create the same users and roles on every peer independently
         Map<ServiceHost, Collection<String>> roleLinksByHost = new HashMap<>();
         for (VerificationHost h : this.host.getInProcessHostMap().values()) {
-            authHelper.createUserService(h, "jane@doe.com");
-            authHelper.createRoles(h);
+            String email = "jane@doe.com";
+            authHelper.createUserService(h, email);
+            authHelper.createRoles(h, email);
         }
 
         // Get roles from all nodes
         Map<ServiceHost, Map<URI, RoleState>> roleStateByHost = getRolesByHost(roleLinksByHost);
 
-        this.host.setNodeGroupQuorum(this.nodeCount);
         // Join nodes to force synchronization and convergence
         this.host.joinNodesAndVerifyConvergence(this.host.getPeerCount());
 
@@ -1960,18 +2903,83 @@ public class TestNodeGroupService {
             }
         }
 
+        // create some example tasks, which delete example services. We dont have any
+        // examples services created, which is good, since we just want these tasks to
+        // go to finished state, then verify, after node restart, they all start
+        Set<String> exampleTaskLinks = new ConcurrentSkipListSet<>();
+        createReplicatedExampleTasks(exampleTaskLinks, null);
+
+        Set<String> exampleLinks = new ConcurrentSkipListSet<>();
+        verifyReplicatedAuthorizedPost(exampleLinks);
+
+        // verify restart, with authorization.
+        // stop one host
+        VerificationHost hostToStop = this.host.getInProcessHostMap().values().iterator().next();
+        stopAndRestartHost(exampleLinks, exampleTaskLinks, hostToStop);
+    }
+
+    private void createReplicatedExampleTasks(Set<String> exampleTaskLinks, String name)
+            throws Throwable {
+        URI factoryUri = UriUtils.buildFactoryUri(this.host.getPeerHost(),
+                ExampleTaskService.class);
+        this.host.setSystemAuthorizationContext();
+        // Sample body that this user is authorized to create
+        ExampleTaskServiceState exampleServiceState = new ExampleTaskServiceState();
+        if (name != null) {
+            exampleServiceState.customQueryClause = Query.Builder.create()
+                    .addFieldClause(ExampleServiceState.FIELD_NAME_NAME, name).build();
+        }
+        this.host.testStart("creating example *task* instances", null, this.serviceCount);
+        for (int i = 0; i < this.serviceCount; i++) {
+            CompletionHandler c = (o, e) -> {
+                if (e != null) {
+                    this.host.failIteration(e);
+                    return;
+                }
+                ExampleTaskServiceState rsp = o.getBody(ExampleTaskServiceState.class);
+                synchronized (exampleTaskLinks) {
+                    exampleTaskLinks.add(rsp.documentSelfLink);
+                }
+                this.host.completeIteration();
+            };
+            this.host.send(Operation
+                    .createPost(factoryUri)
+                    .setBody(exampleServiceState)
+                    .setCompletion(c));
+        }
+        this.host.testWait();
+
+        // ensure all tasks are in finished state
+        this.host.waitFor("Example tasks did not finish", () -> {
+            ServiceDocumentQueryResult rsp = this.host.getExpandedFactoryState(factoryUri);
+            for (Object o : rsp.documents.values()) {
+                ExampleTaskServiceState doc = Utils.fromJson(o, ExampleTaskServiceState.class);
+                if (TaskState.isFailed(doc.taskInfo)) {
+                    this.host.log("task %s failed: %s", doc.documentSelfLink, doc.failureMessage);
+                    throw new IllegalStateException("task failed");
+                }
+                if (!TaskState.isFinished(doc.taskInfo)) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+
+    private void verifyReplicatedAuthorizedPost(Set<String> exampleLinks)
+            throws Throwable {
         Collection<VerificationHost> hosts = this.host.getInProcessHostMap().values();
         RoundRobinIterator<VerificationHost> it = new RoundRobinIterator<>(hosts);
         int exampleServiceCount = this.serviceCount;
 
+        String userLink = UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USERS, "jane@doe.com");
         // Verify we can assert identity and make a request to every host
-        this.host.assumeIdentity(AuthorizationHelper.USER_SERVICE_PATH, null);
+        this.host.assumeIdentity(userLink);
 
         // Sample body that this user is authorized to create
         ExampleServiceState exampleServiceState = new ExampleServiceState();
         exampleServiceState.name = "jane";
 
-        Set<String> exampleLinks = new ConcurrentSkipListSet<>();
         this.host.testStart("creating example instances", null, exampleServiceCount);
         for (int i = 0; i < exampleServiceCount; i++) {
             CompletionHandler c = (o, e) -> {
@@ -1980,12 +2988,16 @@ public class TestNodeGroupService {
                     return;
                 }
 
-                // Verify the user is set as principal
-                ExampleServiceState state = o.getBody(ExampleServiceState.class);
-                assertEquals(state.documentAuthPrincipalLink,
-                        AuthorizationHelper.USER_SERVICE_PATH);
-                exampleLinks.add(state.documentSelfLink);
-                this.host.completeIteration();
+                try {
+                    // Verify the user is set as principal
+                    ExampleServiceState state = o.getBody(ExampleServiceState.class);
+                    assertEquals(state.documentAuthPrincipalLink,
+                            userLink);
+                    exampleLinks.add(state.documentSelfLink);
+                    this.host.completeIteration();
+                } catch (Throwable e2) {
+                    this.host.failIteration(e2);
+                }
             };
             this.host.send(Operation
                     .createPost(UriUtils.buildFactoryUri(it.next(), ExampleService.class))
@@ -2015,16 +3027,11 @@ public class TestNodeGroupService {
                     }));
         }
         this.host.testWait();
-        this.host.toggleNegativeTestMode(true);
-
-        // verify restart, with authorization.
-        // stop one host
-        VerificationHost hostToStop = this.host.getInProcessHostMap().values().iterator().next();
-        restartAuthorizedHost(exampleLinks, hostToStop);
-
+        this.host.toggleNegativeTestMode(false);
     }
 
-    private void restartAuthorizedHost(Set<String> exampleLinks, VerificationHost hostToStop)
+    private void stopAndRestartHost(Set<String> exampleLinks, Set<String> exampleTaskLinks,
+            VerificationHost hostToStop)
             throws Throwable, InterruptedException {
         // relax quorum
         this.host.setNodeGroupQuorum(this.nodeCount - 1);
@@ -2037,14 +3044,27 @@ public class TestNodeGroupService {
         this.host.waitForNodeGroupConvergence(2, 2);
         VerificationHost existingHost = this.host.getInProcessHostMap().values().iterator().next();
 
-        hostToStop.setPort(0);
-        hostToStop.start();
-        Thread.sleep(250);
-        hostToStop.waitForServiceAvailable(UriUtils.buildUri(hostToStop,
-                ExampleService.FACTORY_LINK));
+        waitForReplicatedFactoryServiceAvailable(
+                this.host.getPeerServiceUri(ExampleTaskService.FACTORY_LINK),
+                ServiceUriPaths.DEFAULT_NODE_SELECTOR);
+        waitForReplicatedFactoryServiceAvailable(
+                this.host.getPeerServiceUri(ExampleService.FACTORY_LINK),
+                ServiceUriPaths.DEFAULT_NODE_SELECTOR);
+
+        // create some additional tasks on the remaining two hosts, but make sure they don't delete
+        // any example service instances, by specifying a name value we know will not match anything
+        createReplicatedExampleTasks(exampleTaskLinks, UUID.randomUUID().toString());
+
+        // delete some of the task links, to test synchronization of deleted entries on the restarted
+        // host
+        Set<String> deletedExampleLinks = deleteSomeServices(exampleLinks);
 
         // increase quorum on existing nodes, so they wait for new node
         this.host.setNodeGroupQuorum(this.nodeCount);
+
+        hostToStop.setPort(0);
+        hostToStop.setSecurePort(0);
+        VerificationHost.restartStatefulHost(hostToStop);
 
         // restart host, rejoin it
         URI nodeGroupU = UriUtils.buildUri(hostToStop, ServiceUriPaths.DEFAULT_NODE_GROUP);
@@ -2058,21 +3078,58 @@ public class TestNodeGroupService {
         // set quorum on new node as well
         this.host.setNodeGroupQuorum(this.nodeCount);
 
-        // wait until example factory is ready again
-        hostToStop.waitForServiceAvailable(UriUtils.buildUri(hostToStop,
-                ExampleService.FACTORY_LINK));
-
         this.host.resetAuthorizationContext();
-        // verify all services are restarted
-        this.host.waitFor("Services not started in restarted host", () -> {
-            for (String s : exampleLinks) {
-                ProcessingStage st = hostToStop.getServiceStage(s);
-                if (st == null) {
-                    return false;
-                }
-            }
-            return true;
+
+        this.host.waitFor("Task services not started in restarted host:" + exampleTaskLinks, () -> {
+            return checkChildServicesIfStarted(exampleTaskLinks, hostToStop) == 0;
         });
+
+        // verify all services, not previously deleted, are restarted
+        this.host.waitFor("Services not started in restarted host:" + exampleLinks, () -> {
+            return checkChildServicesIfStarted(exampleLinks, hostToStop) == 0;
+        });
+
+        int deletedCount = deletedExampleLinks.size();
+        this.host.waitFor("Deleted services still present in restarted host", () -> {
+            return checkChildServicesIfStarted(deletedExampleLinks, hostToStop) == deletedCount;
+        });
+    }
+
+    private Set<String> deleteSomeServices(Set<String> exampleLinks)
+            throws Throwable {
+        int deleteCount = exampleLinks.size() / 3;
+        Iterator<String> itLinks = exampleLinks.iterator();
+        Set<String> deletedExampleLinks = new HashSet<>();
+        this.host.testStart(deleteCount);
+        for (int i = 0; i < deleteCount; i++) {
+            String link = itLinks.next();
+            deletedExampleLinks.add(link);
+            exampleLinks.remove(link);
+            Operation delete = Operation.createDelete(this.host.getPeerServiceUri(link))
+                    .setCompletion(this.host.getCompletion());
+            this.host.send(delete);
+        }
+        this.host.testWait();
+        this.host.log("Deleted links: %s", deletedExampleLinks);
+        return deletedExampleLinks;
+    }
+
+    private int checkChildServicesIfStarted(Set<String> exampleTaskLinks,
+            VerificationHost host) {
+        this.host.setSystemAuthorizationContext();
+        int notStartedCount = 0;
+        for (String s : exampleTaskLinks) {
+            ProcessingStage st = host.getServiceStage(s);
+            if (st == null) {
+                notStartedCount++;
+            }
+        }
+        this.host.resetAuthorizationContext();
+        if (notStartedCount > 0) {
+            this.host.log("%d services not started on %s (%s)", notStartedCount,
+                    host.getPublicUri(), host.getId());
+        }
+        return notStartedCount;
     }
 
     private Map<ServiceHost, Map<URI, RoleState>> getRolesByHost(
@@ -2092,30 +3149,6 @@ public class TestNodeGroupService {
         return roleStateByHost;
     }
 
-    private void verifyFactoryAvailable(URI factoryUri)
-            throws Throwable {
-        URI statsUri = UriUtils.buildStatsUri(factoryUri);
-        Date exp = this.host.getTestExpiration();
-        while (new Date().before(exp)) {
-            ServiceStats stats = this.host.getServiceState(null, ServiceStats.class, statsUri);
-            ServiceStat availableStat = stats.entries
-                    .get(Service.STAT_NAME_AVAILABLE);
-            if (availableStat == null) {
-                // no stat == by default available
-                break;
-            }
-
-            if (availableStat.latestValue == Service.STAT_VALUE_TRUE) {
-                return;
-            }
-
-            this.host.log("Not converged, expected %s, stat: %f", Service.STAT_VALUE_TRUE,
-                    availableStat.latestValue);
-
-            Thread.sleep(250);
-        }
-    }
-
     private void verifyOperationJoinAcrossPeers(Map<URI, ReplicationTestServiceState> childStates)
             throws Throwable {
         // do a OperationJoin across N nodes, making sure join works when forwarding is involved
@@ -2123,7 +3156,7 @@ public class TestNodeGroupService {
         for (ReplicationTestServiceState st : childStates.values()) {
             Operation get = Operation.createGet(
                     this.host.getPeerServiceUri(st.documentSelfLink)).setReferer(
-                    this.host.getReferer());
+                            this.host.getReferer());
             joinedOps.add(get);
         }
 
@@ -2146,18 +3179,15 @@ public class TestNodeGroupService {
                                 }
                             }
                             this.host.completeIteration();
-                        }).sendWith(this.host.getPeerHost());
+                        })
+                .sendWith(this.host.getPeerHost());
         this.host.testWait();
     }
 
-    public Map<String, Set<String>> computeOwnerIdsPerLink(Collection<String> links)
+    public Map<String, Set<String>> computeOwnerIdsPerLink(VerificationHost joinedHost,
+            Collection<String> links)
             throws Throwable {
         Map<String, Set<String>> expectedOwnersPerLink = new ConcurrentSkipListMap<>();
-        // we need to independently verify which host should have been assigned the service links
-        VerificationHost h = this.host.getPeerHost();
-        if (h == null) {
-            return expectedOwnersPerLink;
-        }
         CompletionHandler c = (o, e) -> {
             if (e != null) {
                 this.host.failIteration(e);
@@ -2179,35 +3209,45 @@ public class TestNodeGroupService {
                     .setCompletion(c)
                     .setExpiration(this.host.getOperationTimeoutMicros() + Utils.getNowMicrosUtc());
 
-            h.selectOwner(this.replicationNodeSelector, link, selectOp);
+            joinedHost.selectOwner(this.replicationNodeSelector, link, selectOp);
         }
         this.host.testWait();
         return expectedOwnersPerLink;
     }
 
     public <T extends ServiceDocument> void verifyDocumentOwnerAndEpoch(Map<String, T> childStates,
-            Set<String> ownerIds, int minExpectedEpochRetries,
+            VerificationHost joinedHost,
+            List<URI> joinedHostUris,
+            int minExpectedEpochRetries,
             int maxExpectedEpochRetries, int expectedOwnerChanges)
             throws Throwable, InterruptedException, TimeoutException {
 
-        Map<String, Set<String>> ownerIdsPerLink = computeOwnerIdsPerLink(childStates.keySet());
+        Map<URI, NodeGroupState> joinedHostNodeGroupStates = this.host.getServiceState(null,
+                NodeGroupState.class, joinedHostUris);
+        Set<String> joinedHostOwnerIds = new HashSet<>();
+        for (NodeGroupState st : joinedHostNodeGroupStates.values()) {
+            joinedHostOwnerIds.add(st.documentOwner);
+        }
+
+        Map<String, Set<String>> ownerIdsPerLink = computeOwnerIdsPerLink(joinedHost,
+                childStates.keySet());
         Date exp = this.host.getTestExpiration();
         while (new Date().before(exp)) {
             boolean isConverged = true;
             Map<String, Set<Long>> epochsPerLink = new HashMap<>();
             List<URI> nodeSelectorStatsUris = new ArrayList<>();
 
-            for (URI baseNodeUri : this.host.getNodeGroupMap().keySet()) {
+            for (URI baseNodeUri : joinedHostUris) {
                 nodeSelectorStatsUris.add(UriUtils.buildUri(baseNodeUri,
                         ServiceUriPaths.DEFAULT_NODE_SELECTOR,
                         ServiceHost.SERVICE_URI_SUFFIX_STATS));
 
-                URI factoryUri = UriUtils.buildExpandLinksQueryUri(UriUtils.buildUri(
-                        baseNodeUri, this.replicationTargetFactoryLink));
+                URI factoryUri = UriUtils.buildUri(
+                        baseNodeUri, this.replicationTargetFactoryLink);
                 ServiceDocumentQueryResult factoryRsp = this.host
                         .getFactoryState(factoryUri);
-                if (factoryRsp.documents == null
-                        || factoryRsp.documents.size() != childStates.size()) {
+                if (factoryRsp.documentLinks == null
+                        || factoryRsp.documentLinks.size() != childStates.size()) {
                     isConverged = false;
                     // services not all started in new nodes yet;
                     this.host.log("Node %s does not have all services: %s", baseNodeUri,
@@ -2215,13 +3255,21 @@ public class TestNodeGroupService {
                     break;
                 }
 
+                List<URI> childUris = new ArrayList<>();
+                for (String link : childStates.keySet()) {
+                    childUris.add(UriUtils.buildUri(baseNodeUri, link));
+                }
+
+                // retrieve the document state directly from each service
+                Map<URI, ServiceDocument> childDocs =
+                        this.host.getServiceState(null, ServiceDocument.class, childUris);
+
                 List<URI> childStatUris = new ArrayList<>();
-                for (Object s : factoryRsp.documents.values()) {
-                    ServiceDocument state = Utils.fromJson(s, ServiceDocument.class);
+                for (ServiceDocument state : childDocs.values()) {
 
                     if (state.documentOwner == null) {
                         this.host.log("Owner not set in service on new node: %s",
-                                Utils.toJsonHtml(s));
+                                Utils.toJsonHtml(state));
                         isConverged = false;
                         break;
                     }
@@ -2239,23 +3287,23 @@ public class TestNodeGroupService {
                     epochs.add(state.documentEpoch);
                     Set<String> eligibleNodeIds = ownerIdsPerLink.get(state.documentSelfLink);
 
-                    if (!ownerIds.contains(state.documentOwner)) {
+                    if (!joinedHostOwnerIds.contains(state.documentOwner)) {
                         this.host.log("Owner id for %s not expected: %s, valid ids: %s",
-                                state.documentSelfLink, state.documentOwner, ownerIds);
+                                state.documentSelfLink, state.documentOwner, joinedHostOwnerIds);
                         isConverged = false;
                         break;
                     }
 
                     if (eligibleNodeIds != null && !eligibleNodeIds.contains(state.documentOwner)) {
                         this.host.log("Owner id for %s not eligible: %s, eligible ids: %s",
-                                state.documentSelfLink, state.documentOwner, ownerIds);
+                                state.documentSelfLink, state.documentOwner, joinedHostOwnerIds);
                         isConverged = false;
                         break;
                     }
                 }
 
                 int nodeGroupMaintCount = 0;
-                int missingDocOwnerToggleCount = 0;
+                int docOwnerToggleOffCount = 0;
                 int docOwnerToggleCount = 0;
                 // verify stats were reported by owner node, not a random peer
                 Map<URI, ServiceStats> allChildStats = this.host.getServiceState(null,
@@ -2271,17 +3319,17 @@ public class TestNodeGroupService {
                         break;
                     }
                     ServiceStat maintStat = childStats.entries
-                            .get(ReplicationTestService.STAT_NAME_HANDLE_NODE_GROUP_MAINTENANCE_COUNT);
+                            .get(Service.STAT_NAME_NODE_GROUP_CHANGE_MAINTENANCE_COUNT);
                     if (maintStat != null) {
                         nodeGroupMaintCount++;
                     }
-                    ServiceStat missingToggleStat = childStats.entries
-                            .get(ReplicationTestService.STAT_NAME_MISSING_SERVICE_OPTION_TOGGLE_COUNT);
-                    if (missingToggleStat != null) {
-                        missingDocOwnerToggleCount++;
+                    ServiceStat docOwnerToggleOffStat = childStats.entries
+                            .get(Service.STAT_NAME_DOCUMENT_OWNER_TOGGLE_OFF_MAINT_COUNT);
+                    if (docOwnerToggleOffStat != null) {
+                        docOwnerToggleOffCount++;
                     }
                     ServiceStat docOwnerToggleStat = childStats.entries
-                            .get(ReplicationTestService.STAT_NAME_SERVICE_OPTION_TOGGLE_COUNT);
+                            .get(Service.STAT_NAME_DOCUMENT_OWNER_TOGGLE_ON_MAINT_COUNT);
                     if (docOwnerToggleStat != null) {
                         docOwnerToggleCount++;
                     }
@@ -2292,15 +3340,10 @@ public class TestNodeGroupService {
                     isConverged = false;
                 }
 
-                this.host.log("Failed doc owner count: %d, toggle count: %d",
-                        missingDocOwnerToggleCount, docOwnerToggleCount);
-                if (docOwnerToggleCount < expectedOwnerChanges) {
+                this.host.log("Toggled off doc owner count: %d, toggle on count: %d",
+                        docOwnerToggleOffCount, docOwnerToggleCount);
+                if (docOwnerToggleCount < childStates.size()) {
                     isConverged = false;
-                }
-
-                if (missingDocOwnerToggleCount > 0) {
-                    throw new IllegalStateException(
-                            "Missing service option config details in maintenance for service");
                 }
 
                 // verify epochs
@@ -2354,6 +3397,18 @@ public class TestNodeGroupService {
             Function<T, Void> updateBodySetter,
             BiPredicate<T, T> convergenceChecker,
             Map<String, T> initialStatesPerChild) throws Throwable {
+        return doStateUpdateReplicationTest(action, childCount, updateCount, expectedVersion,
+                updateBodySetter, convergenceChecker, initialStatesPerChild, null, null);
+    }
+
+    private <T extends ServiceDocument> Map<String, T> doStateUpdateReplicationTest(Action action,
+            int childCount, int updateCount,
+            long expectedVersion,
+            Function<T, Void> updateBodySetter,
+            BiPredicate<T, T> convergenceChecker,
+            Map<String, T> initialStatesPerChild,
+            Map<Action, Long> countsPerAction,
+            Map<Action, Long> elapsedTimePerAction) throws Throwable {
         this.host.testStart("Replicated " + action, null, childCount * updateCount);
 
         if (!this.expectFailure) {
@@ -2361,10 +3416,11 @@ public class TestNodeGroupService {
             for (URI fu : this.host.getNodeGroupToFactoryMap(this.replicationTargetFactoryLink)
                     .values()) {
                 // confirm that /factory/available returns 200 across all nodes
-                this.host.waitForServiceAvailable(fu);
+                waitForReplicatedFactoryServiceAvailable(fu, ServiceUriPaths.DEFAULT_NODE_SELECTOR);
             }
         }
 
+        long before = Utils.getNowMicrosUtc();
         AtomicInteger failedCount = new AtomicInteger();
         // issue an update to each child service and verify it was reflected
         // among
@@ -2377,44 +3433,51 @@ public class TestNodeGroupService {
 
             for (int i = 0; i < updateCount; i++) {
 
-                long sentTime = Utils.getNowMicrosUtc();
-                String contextId = sentTime + "";
+                long sentTime = 0;
+                if (this.expectFailure) {
+                    sentTime = Utils.getNowMicrosUtc();
+                }
                 URI factoryOnRandomPeerUri = this.host
                         .getPeerServiceUri(this.replicationTargetFactoryLink);
 
-                this.host.send(Operation
-                        .createPatch(UriUtils.buildUri(factoryOnRandomPeerUri,
-                                initState.documentSelfLink))
-                        .setAction(action)
-                        .setContextId(contextId)
-                        .forceRemote()
-                        .setBody(initState)
-                        .setCompletion(
-                                (o, e) -> {
-                                    if (e != null) {
-                                        if (this.expectFailure) {
-                                            failedCount.incrementAndGet();
-                                            this.host.completeIteration();
-                                            return;
-                                        }
-                                        this.host.failIteration(e);
-                                        return;
-                                    }
+                long finalSentTime = sentTime;
+                this.host
+                        .send(Operation
+                                .createPatch(UriUtils.buildUri(factoryOnRandomPeerUri,
+                                        initState.documentSelfLink))
+                                .setAction(action)
+                                .forceRemote()
+                                .setBodyNoCloning(initState)
+                                .setCompletion(
+                                        (o, e) -> {
+                                            if (e != null) {
+                                                if (this.expectFailure) {
+                                                    failedCount.incrementAndGet();
+                                                    this.host.completeIteration();
+                                                    return;
+                                                }
+                                                this.host.failIteration(e);
+                                                return;
+                                            }
 
-                                    if (this.expectFailure
-                                            && this.expectedFailureStartTimeMicros > 0
-                                            && sentTime > this.expectedFailureStartTimeMicros) {
-                                        this.host.failIteration(new IllegalStateException(
-                                                "Request should have failed: %s" + o.toString()
-                                                        + " sent at " + sentTime));
-                                        return;
-                                    }
-                                    this.host.completeIteration();
-                                }));
+                                            if (this.expectFailure
+                                                    && this.expectedFailureStartTimeMicros > 0
+                                                    && finalSentTime > this.expectedFailureStartTimeMicros) {
+                                                this.host.failIteration(new IllegalStateException(
+                                                        "Request should have failed: %s"
+                                                                + o.toString()
+                                                                + " sent at " + finalSentTime));
+                                                return;
+                                            }
+                                            this.host.completeIteration();
+                                        }));
             }
         }
         this.host.testWait();
         this.host.logThroughput();
+
+        updatePerfDataPerAction(action, before, (long) (childCount * updateCount), countsPerAction,
+                elapsedTimePerAction);
 
         if (this.expectFailure) {
             this.host.log("Failed count: %d", failedCount.get());
@@ -2443,13 +3506,18 @@ public class TestNodeGroupService {
                 expectedVersion);
     }
 
-    private Map<String, ExampleServiceState> doExampleFactoryPostReplicationTest(int childCount)
+    private Map<String, ExampleServiceState> doExampleFactoryPostReplicationTest(int childCount,
+            Map<Action, Long> countPerAction,
+            Map<Action, Long> elapsedTimePerAction)
             throws Throwable, TimeoutException {
-        return doExampleFactoryPostReplicationTest(childCount, null);
+        return doExampleFactoryPostReplicationTest(childCount, null,
+                countPerAction, elapsedTimePerAction);
     }
 
     private Map<String, ExampleServiceState> doExampleFactoryPostReplicationTest(int childCount,
-            EnumSet<TestProperty> props) throws Throwable {
+            EnumSet<TestProperty> props,
+            Map<Action, Long> countPerAction,
+            Map<Action, Long> elapsedTimePerAction) throws Throwable {
 
         if (props == null) {
             props = EnumSet.noneOf(TestProperty.class);
@@ -2467,10 +3535,8 @@ public class TestNodeGroupService {
         this.host.log("%s: Starting replication", this.host.buildTestNameFromStack());
 
         String factoryPath = this.replicationTargetFactoryLink;
-        long[] startAndEndTime = new long[2];
-
-        startAndEndTime[0] = System.nanoTime();
         Map<String, ExampleServiceState> serviceStates = new HashMap<>();
+        long before = Utils.getNowMicrosUtc();
         this.host.testStart(childCount);
         for (int i = 0; i < childCount; i++) {
             URI factoryOnRandomPeerUri = this.host.getPeerServiceUri(factoryPath);
@@ -2507,6 +3573,10 @@ public class TestNodeGroupService {
         }
 
         this.host.testWait();
+        updatePerfDataPerAction(Action.POST, before, (long) this.serviceCount, countPerAction,
+                elapsedTimePerAction);
+
+        this.host.logThroughput();
 
         return waitForReplicatedFactoryChildServiceConvergence(serviceStates,
                 this.exampleStateConvergenceChecker,
@@ -2554,7 +3624,6 @@ public class TestNodeGroupService {
             BiPredicate<T, T> stateChecker,
             int expectedChildCount, long expectedVersion)
             throws Throwable, TimeoutException {
-
         // now poll all hosts until they converge: They all have a child service
         // with the expected URI and it has the same state
 
@@ -2567,8 +3636,9 @@ public class TestNodeGroupService {
             AtomicInteger getFailureCount = new AtomicInteger();
             if (expectedChildCount != 0) {
                 // issue direct GETs to the services, we do not trust the factory
-                this.host.testStart(serviceStates.size());
+
                 for (String link : serviceStates.keySet()) {
+                    TestContext ctx = this.host.testCreate(1);
                     Operation get = Operation.createGet(UriUtils.buildUri(node, link))
                             .setReferer(this.host.getReferer())
                             .setExpiration(Utils.getNowMicrosUtc() + TimeUnit.SECONDS.toMicros(5))
@@ -2577,11 +3647,12 @@ public class TestNodeGroupService {
                                         if (e != null) {
                                             getFailureCount.incrementAndGet();
                                         }
-                                        this.host.completeIteration();
+                                        ctx.completeIteration();
                                     });
                     this.host.sendRequest(get);
+                    this.host.testWait(ctx);
                 }
-                this.host.testWait();
+
             }
 
             if (getFailureCount.get() > 0) {
@@ -2618,13 +3689,22 @@ public class TestNodeGroupService {
 
             this.host.testWait();
 
-            long expectedNodeCountPerLink = factories.size();
+            long expectedNodeCountPerLinkMax = factories.size();
+            long expectedNodeCountPerLinkMin = expectedNodeCountPerLinkMax;
             if (this.replicationFactor != 0) {
-                expectedNodeCountPerLink = this.replicationFactor;
+                // We expect services to end up either on K nodes, or K + 1 nodes,
+                // if limited replication is enabled. The reason we might end up with services on
+                // an additional node, is because we elect an owner to synchronize an entire factory,
+                // using the factory's link, and that might end up on a node not used for any child.
+                // This will produce children on that node, giving us K+1 replication, which is acceptable
+                // given K (replication factor) << N (total nodes in group)
+                expectedNodeCountPerLinkMax = this.replicationFactor + 1;
+                expectedNodeCountPerLinkMin = this.replicationFactor;
             }
 
             if (expectedChildCount == 0) {
-                expectedNodeCountPerLink = 0;
+                expectedNodeCountPerLinkMax = 0;
+                expectedNodeCountPerLinkMin = 0;
             }
 
             // build a service link to node map so we can tell on which node each service instance landed
@@ -2661,9 +3741,11 @@ public class TestNodeGroupService {
                     continue;
                 }
 
-                if (e.getValue().size() != expectedNodeCountPerLink) {
-                    this.host.log("Service %s found on %d nodes, expected %d", e.getKey(), e
-                            .getValue().size(), expectedNodeCountPerLink);
+                if (e.getValue().size() < expectedNodeCountPerLinkMin
+                        || e.getValue().size() > expectedNodeCountPerLinkMax) {
+                    this.host.log("Service %s found on %d nodes, expected %d -> %d", e.getKey(), e
+                            .getValue().size(), expectedNodeCountPerLinkMin,
+                            expectedNodeCountPerLinkMax);
                     isConverged = false;
                 }
             }
@@ -2678,14 +3760,11 @@ public class TestNodeGroupService {
                 return updatedStatesPerSelfLink;
             }
 
-            // verify /available reports correct results
-            this.host.log("Starting convergence check for %s", factories);
+            // verify /available reports correct results on the factory.
+            URI factoryUri = factories.values().iterator().next();
             Class<?> stateType = serviceStates.values().iterator().next().getClass();
-
-            for (URI factory : factories.values()) {
-                this.host.waitForServiceAvailable(factory);
-                this.host.log("Factory %s converged", factory);
-            }
+            waitForReplicatedFactoryServiceAvailable(factoryUri,
+                    ServiceUriPaths.DEFAULT_NODE_SELECTOR);
 
             // we have the correct number of services on all hosts. Now verify
             // the state of each service matches what we expect
@@ -2749,7 +3828,8 @@ public class TestNodeGroupService {
                     convergedNodeCount++;
                 }
 
-                if (convergedNodeCount != expectedNodeCountPerLink) {
+                if (convergedNodeCount < expectedNodeCountPerLinkMin
+                        || convergedNodeCount > expectedNodeCountPerLinkMax) {
                     isConverged = false;
                     break;
                 }
@@ -2821,10 +3901,11 @@ public class TestNodeGroupService {
     private void stopHostsAndVerifyQueuing(Collection<VerificationHost> hostsToStop,
             VerificationHost remainingHost,
             Collection<URI> serviceTargets) throws Throwable {
+        this.host.log("Starting to stop hosts and verify queuing");
 
         // reduce node expiration for unavailable hosts so gossip warning
         // messages do not flood the logs
-        this.nodeGroupConfig.nodeRemovalDelayMicros = TimeUnit.MILLISECONDS.toMicros(250);
+        this.nodeGroupConfig.nodeRemovalDelayMicros = remainingHost.getMaintenanceIntervalMicros();
         this.host.setNodeGroupConfig(this.nodeGroupConfig);
         this.setOperationTimeoutMicros(TimeUnit.SECONDS.toMicros(10));
 
@@ -2859,18 +3940,59 @@ public class TestNodeGroupService {
                 if (s.outboundRequestFailureCompletion.get() < serviceTargets.size()) {
                     // We expect at least one failure per service target, if we have less
                     // keep polling.
+                    this.host.log(
+                            "Not converged yet: service %s on host %s has %d outbound request failures, which is lower than %d",
+                            s.getSelfLink(), s.getHost().getId(),
+                            s.outboundRequestFailureCompletion.get(), serviceTargets.size());
                     isConverged = false;
                     break;
                 }
             }
 
             if (isConverged) {
+                this.host.log("Done with stop hosts and verify queuing");
                 return;
             }
 
             Thread.sleep(250);
         }
-        ;
+
         throw new TimeoutException();
+    }
+
+    private void waitForReplicatedFactoryServiceAvailable(URI uri, String nodeSelectorPath)
+            throws Throwable {
+        if (this.skipAvailabilityChecks) {
+            return;
+        }
+        if (UriUtils.isHostEqual(this.host, uri)) {
+
+            VerificationHost host = this.host;
+
+            // if uri is for in-process peers, then use the one
+            URI peerUri = UriUtils.buildUri(uri.toString().replace(uri.getPath(), ""));
+            VerificationHost peer = this.host.getInProcessHostMap().get(peerUri);
+            if (peer != null) {
+                host = peer;
+            }
+
+            TestContext ctx = host.testCreate(1);
+            CompletionHandler ch = (o, e) -> {
+                if (e != null) {
+                    String msg = "Failed to check replicated factory service availability";
+                    ctx.failIteration(new RuntimeException(msg, e));
+                    return;
+                }
+                ctx.completeIteration();
+            };
+
+            host.registerForServiceAvailability(ch, nodeSelectorPath, true, uri.getPath());
+            ctx.await();
+
+        } else {
+            // for remote host
+            this.host.waitForReplicatedFactoryServiceAvailable(uri, nodeSelectorPath);
+        }
+
     }
 }

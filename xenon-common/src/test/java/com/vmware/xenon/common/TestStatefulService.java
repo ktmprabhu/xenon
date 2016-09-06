@@ -14,6 +14,7 @@
 package com.vmware.xenon.common;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
@@ -24,7 +25,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Test;
@@ -34,6 +37,7 @@ import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
+import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.TestProperty;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
@@ -116,6 +120,76 @@ class DefaultHandlerTestService extends StatefulService {
             logFine("Initial state is %s", Utils.toJsonHtml(s));
         }
         startPost.complete();
+    }
+}
+
+
+/**
+ * Test service options.
+ */
+class MaintenanceTestService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/tests/maintenanceService";
+    /**
+     * The state includes both a reference and a primitive type so as to test both.
+     */
+    public static class MaintenanceTestState extends ServiceDocument {
+        public String name;
+    }
+
+    public MaintenanceTestService() {
+        super(MaintenanceTestState.class);
+        toggleOption(ServiceOption.PERSISTENCE, true);
+        toggleOption(ServiceOption.REPLICATION, true);
+        toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
+        toggleOption(ServiceOption.ON_DEMAND_LOAD, true);
+    }
+
+    @Override
+    public void handlePeriodicMaintenance(Operation post) {
+        post.complete();
+    }
+}
+
+class MaintenanceVerificationService extends StatefulService {
+    /**
+     * See {@link TestStatefulService#periodicMaintenanceVerification()}
+     */
+    public AtomicBoolean delayMaintenance = new AtomicBoolean(false);
+
+    public MaintenanceVerificationService() {
+        super(ServiceDocument.class);
+        toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
+        toggleOption(ServiceOption.IDEMPOTENT_POST, true);
+        toggleOption(ServiceOption.INSTRUMENTATION, true);
+        setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(250));
+    }
+
+    @Override
+    public void handlePeriodicMaintenance(Operation op) {
+        while (this.delayMaintenance.get()) {
+            try {
+                Thread.sleep(this.getMaintenanceIntervalMicros() / 1000);
+            } catch (Exception e) {
+                op.fail(e);
+            }
+        }
+        op.complete();
+    }
+}
+
+class IdempotentPostService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/tests/idempotentpostservice";
+
+    public static class State extends ServiceDocument {
+        public String name;
+    }
+
+    public IdempotentPostService() {
+        super(State.class);
+        toggleOption(ServiceOption.PERSISTENCE, true);
+        toggleOption(ServiceOption.REPLICATION, true);
+        toggleOption(ServiceOption.OWNER_SELECTION, true);
+        toggleOption(ServiceOption.IDEMPOTENT_POST, true);
     }
 }
 
@@ -262,16 +336,16 @@ public class TestStatefulService extends BasicReusableHostTestCase {
         this.host.testStart(services.size());
         for (Service s : services) {
             ServiceConfigUpdateRequest body = ServiceConfigUpdateRequest.create();
-            body.operationQueueLimit = (int) c;
+            body.operationQueueLimit = (int) (c * Utils.DEFAULT_IO_THREAD_COUNT);
             URI configUri = UriUtils.buildConfigUri(s.getUri());
             this.host.send(Operation.createPatch(configUri).setBody(body)
                     .setCompletion(this.host.getCompletion()));
         }
         this.host.testWait();
 
-        this.host.doPutPerService(c, props, services);
-        this.host.doPutPerService(c, props, services);
-        this.host.doPutPerService(c, props, services);
+        for (int i = 0; i < 5; i++) {
+            this.host.doPutPerService(c, props, services);
+        }
     }
 
     @Test
@@ -364,7 +438,7 @@ public class TestStatefulService extends BasicReusableHostTestCase {
                     s.name = UUID.randomUUID().toString();
                     s.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
                     o.setBody(s);
-                } , factoryService.getUri());
+                }, factoryService.getUri());
 
         // services should expire, and we will confirm the delete handler was called. We only expire when we try to access
         // a document, so do a factory get ...
@@ -388,6 +462,41 @@ public class TestStatefulService extends BasicReusableHostTestCase {
         }
 
         throw new TimeoutException();
+    }
+
+    @Test
+    public void expirationNonPersistedService() throws Throwable {
+        List<Service> services = this.host.doThroughputServiceStart(this.serviceCount,
+                MinimalTestService.class,
+                this.host.buildMinimalTestState(),
+                EnumSet.noneOf(ServiceOption.class), null);
+
+        int expMillis = 250;
+        // patch services to expire in the near future
+        TestContext ctx = testCreate(services.size());
+        for (Service s : services) {
+            MinimalTestServiceState body = new MinimalTestServiceState();
+            body.id = Utils.getNowMicrosUtc() + "";
+            body.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
+                    + TimeUnit.MILLISECONDS.toMicros(expMillis);
+            Operation patchExp = Operation.createPatch(s.getUri())
+                    .setBody(body)
+                    .setCompletion(ctx.getCompletion());
+            this.host.send(patchExp);
+        }
+        testWait(ctx);
+
+        // expiration will occur on the next maintenance interval
+        Thread.sleep(expMillis);
+
+        this.host.waitFor("never expired", () -> {
+            for (Service s : services) {
+                if (this.host.getServiceStage(s.getSelfLink()) != null) {
+                    return false;
+                }
+            }
+            return true;
+        });
     }
 
     @Test
@@ -527,5 +636,120 @@ public class TestStatefulService extends BasicReusableHostTestCase {
         }
         this.host.testWait();
 
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void invalidServiceOptionsValidation() throws Throwable {
+        this.host.startService(Operation.createPost(
+                UriUtils.buildFactoryUri(host, MaintenanceTestService.class)), FactoryService
+                .create(MaintenanceTestService.class, MaintenanceTestService.MaintenanceTestState.class));
+        this.host.waitForServiceAvailable(MaintenanceTestService.FACTORY_LINK);
+    }
+
+    @Test
+    public void periodicMaintenanceVerification() throws Throwable {
+
+        // This test verifies periodic maintenance tracking in Xenon.
+        // Since the tracking is based on documentSelfLinks, we want to
+        // make sure that the tracking logic can handle duplicate
+        // scheduling calls for the same documentSelfLink. This
+        // can happen if we try to start, stop and restart a service before
+        // it got scheduled the first time.
+
+        String documentSelfLink = UUID.randomUUID().toString();
+
+        // Start by creating a service and intentionally delay the first maintenance
+        // call. This is done to deterministically simulate the race condition.
+        MaintenanceVerificationService service1 = new MaintenanceVerificationService();
+        service1.delayMaintenance.set(true);
+
+        ServiceDocument state = new ServiceDocument();
+        state.documentSelfLink = documentSelfLink;
+
+        this.host.startServiceAndWait(service1, documentSelfLink, state);
+        this.host.stopService(service1);
+
+        // Start again without delaying maintenance. Note, we still haven't exited
+        // handleMaintenance for the previously created service object.
+        MaintenanceVerificationService service2 = new MaintenanceVerificationService();
+        this.host.startServiceAndWait(service2, documentSelfLink, state);
+
+        // Release the old service now to verify that we can handle duplicates.
+        service1.delayMaintenance.set(false);
+
+        ServiceStat hostStat = this.host
+                .getServiceStats(this.host.getManagementServiceUri())
+                .get(Service.STAT_NAME_SERVICE_HOST_MAINTENANCE_COUNT);
+
+        // Wait for three maintenance intervals to elapse.
+        final double maintenanceCount = (hostStat != null) ? hostStat.latestValue : 0;
+        this.host.waitFor("Timeout waiting for the service host to elapse three maintenance intervals",
+                () -> {
+                    ServiceStat serviceStat = service2
+                            .getStat(Service.STAT_NAME_MAINTENANCE_COUNT);
+                    ServiceStat newHostStat = this.host
+                            .getServiceStats(this.host.getManagementServiceUri())
+                            .get(Service.STAT_NAME_SERVICE_HOST_MAINTENANCE_COUNT);
+
+                    if (newHostStat != null && newHostStat.latestValue >= 3.0 + maintenanceCount) {
+                        double hostMaintenanceCount = newHostStat.latestValue;
+                        double serviceMaintenanceCount = serviceStat.latestValue;
+                        if (serviceMaintenanceCount > 0 && serviceMaintenanceCount <= hostMaintenanceCount) {
+                            return true;
+                        }
+
+                        throw new IllegalStateException(
+                                String.format(
+                                        "serviceMaintenanceCount %f was more than hostMaintenanceCount %f",
+                                        serviceMaintenanceCount, hostMaintenanceCount));
+                    }
+                    return false;
+                });
+    }
+
+    @Test
+    public void testIdempotentPostService() throws Throwable {
+        URI factoryUri = UriUtils.buildFactoryUri(host, IdempotentPostService.class);
+        this.host.startService(Operation.createPost(factoryUri),
+                FactoryService.create(IdempotentPostService.class,
+                        IdempotentPostService.State.class));
+        this.host.waitForServiceAvailable(IdempotentPostService.FACTORY_LINK);
+
+        IdempotentPostService.State doc =
+                new IdempotentPostService.State();
+        doc.documentSelfLink = "default";
+        doc.name = "testDocument";
+
+        this.host.testStart(1);
+        this.host.send(Operation.createPost(factoryUri)
+                .setBody(doc)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+
+                            this.host.send(Operation.createPost(factoryUri)
+                                    .setBody(doc)
+                                    .setCompletion(
+                                            (o2, e2) -> {
+                                                if (e2 != null) {
+                                                    this.host.failIteration(e2);
+                                                    return;
+                                                }
+
+                                                IdempotentPostService.State doc2 = o2.getBody(
+                                                        IdempotentPostService.State.class);
+                                                try {
+                                                    assertNotNull(doc2);
+                                                    assertEquals("testDocument", doc2.name);
+                                                    this.host.completeIteration();
+                                                } catch (AssertionError e3) {
+                                                    this.host.failIteration(e3);
+                                                }
+                                            }));
+                        }));
+        this.host.testWait();
     }
 }

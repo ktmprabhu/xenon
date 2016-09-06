@@ -13,9 +13,12 @@
 
 package com.vmware.xenon.common.http.netty;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
@@ -24,8 +27,12 @@ import io.netty.util.AttributeKey;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.SocketContext;
+import com.vmware.xenon.common.ServiceErrorResponse;
+import com.vmware.xenon.common.http.netty.NettyChannelPool.NettyChannelGroupKey;
 
 public class NettyChannelContext extends SocketContext {
+    static final Logger logger = Logger.getLogger(NettyChannelPool.class.getName());
+
     // For HTTP/1.1 channels, this stores the operation associated with the channel
     static final AttributeKey<Operation> OPERATION_KEY = AttributeKey
             .<Operation> valueOf("operation");
@@ -72,10 +79,8 @@ public class NettyChannelContext extends SocketContext {
         return new PooledByteBufAllocator(true, 2, 2, 8192, maxOrder, 64, 32, 16);
     }
 
-    int port;
-    String host;
     private Channel channel;
-    private final String key;
+    private final NettyChannelGroupKey key;
     private Protocol protocol;
 
     // An HTTP/2 connection may have multiple simultaneous operations. This map
@@ -89,13 +94,13 @@ public class NettyChannelContext extends SocketContext {
     // We track the largest stream ID seen, so we know when the connection is exhausted
     private int largestStreamId = 0;
 
-    public NettyChannelContext(String host, int port, String key, Protocol protocol) {
-        this.host = host;
-        this.port = port;
+    private boolean isPoolStopping;
+
+    public NettyChannelContext(NettyChannelGroupKey key, Protocol protocol) {
         this.key = key;
+        this.protocol = protocol;
         if (protocol == Protocol.HTTP2) {
             this.streamIdMap = new HashMap<Integer, Operation>();
-            this.protocol = protocol;
         } else {
             this.streamIdMap = null;
         }
@@ -103,6 +108,15 @@ public class NettyChannelContext extends SocketContext {
 
     public NettyChannelContext setChannel(Channel c) {
         this.channel = c;
+        this.channel.closeFuture().addListener(future -> {
+            if (this.isPoolStopping) {
+                return;
+            }
+            logger.info("Channel closed" +
+                    ", ChannelId:" + this.channel.id() +
+                    ", Protocol:" + this.protocol +
+                    ", NodeChannelGroupKey:" + this.key);
+        });
         return this;
     }
 
@@ -114,7 +128,15 @@ public class NettyChannelContext extends SocketContext {
     }
 
     public NettyChannelContext setOperation(Operation request) {
-        this.channel.attr(OPERATION_KEY).set(request);
+        if (this.channel == null) {
+            return this;
+        }
+        if (this.streamIdMap == null) {
+            this.channel.attr(OPERATION_KEY).set(request);
+        }
+        if (request == null) {
+            return this;
+        }
         request.setSocketContext(this);
         return this;
     }
@@ -159,13 +181,13 @@ public class NettyChannelContext extends SocketContext {
         }
     }
 
-    public boolean haveStreamsInUse() {
+    public boolean hasActiveStreams() {
         synchronized (this.streamIdMap) {
             return !this.streamIdMap.isEmpty();
         }
     }
 
-    public String getKey() {
+    public NettyChannelGroupKey getKey() {
         return this.key;
     }
 
@@ -173,7 +195,7 @@ public class NettyChannelContext extends SocketContext {
         return this.channel;
     }
 
-    public boolean getOpenInProgress() {
+    public boolean isOpenInProgress() {
         return this.openInProgress.get();
     }
 
@@ -212,18 +234,49 @@ public class NettyChannelContext extends SocketContext {
         updateLastUseTime();
     }
 
+    public void close(boolean isShutdown) {
+        this.isPoolStopping = isShutdown;
+        close();
+    }
+
     @Override
     public void close() {
         Channel c = this.channel;
+        this.openInProgress.set(false);
         if (c == null) {
             return;
         }
-        if (!c.isOpen()) {
+
+        if (c.isOpen()) {
+            try {
+                c.close();
+            } catch (Throwable e) {
+            }
+        }
+
+        Throwable e = new IllegalStateException("Socket channel closed:" + this.key);
+        ServiceErrorResponse body = ServiceErrorResponse.createWithShouldRetry(e);
+
+        Operation op = this.getOperation();
+        if (op != null) {
+            setOperation(null);
+            op.setStatusCode(body.statusCode);
+            op.fail(e, body);
             return;
         }
-        try {
-            c.close();
-        } catch (Throwable e) {
+
+        if (this.streamIdMap == null || this.streamIdMap.isEmpty()) {
+            return;
+        }
+
+        List<Operation> ops = new ArrayList<>();
+        synchronized (this.streamIdMap) {
+            ops.addAll(this.streamIdMap.values());
+            this.streamIdMap.clear();
+        }
+        for (Operation o : ops) {
+            o.setStatusCode(body.statusCode);
+            o.fail(e, body);
         }
     }
 }

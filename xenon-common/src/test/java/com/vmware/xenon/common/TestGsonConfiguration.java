@@ -32,12 +32,9 @@ import com.google.gson.JsonPrimitive;
 import com.google.gson.JsonSerializationContext;
 import com.google.gson.JsonSerializer;
 import com.google.gson.reflect.TypeToken;
-
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import com.vmware.xenon.common.ServiceDocument;
-import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.common.serialization.JsonMapper;
 
 public class TestGsonConfiguration {
@@ -119,6 +116,35 @@ public class TestGsonConfiguration {
         assertEquals(compactParsed, prettyParsed);
     }
 
+    @Test
+    public void testToJsonWithFieldHiding() {
+        // Testing without pretty print
+        AnnotatedDoc doc = new AnnotatedDoc();
+        doc.value = new SomeComplexObject("fred", "barney");
+        doc.sensitiveUsageOption = "sensitive information";
+        doc.sensitivePropertyOptions = "sensitive properties";
+
+        String compactRedacted = Utils.toJson(true, false, doc);
+
+        JsonElement expectedRedacted = readJson("{ \"value\": { "
+                + "\"a\": \"fred\", "
+                + "\"b\": \"barney\" "
+                + "} "
+                + BORING_JSON_DOC_BITS
+                + "}");
+        assertEquals(expectedRedacted, readJson(compactRedacted));
+
+        // Testing with pretty print
+        String prettyRedacted = Utils.toJson(true, true, doc);
+
+        assertTrue(prettyRedacted.length() > compactRedacted.length());
+
+        JsonElement compactRedactedParsed = readJson(compactRedacted);
+        JsonElement prettyRedactedParsed = readJson(prettyRedacted);
+
+        assertEquals(compactRedactedParsed, prettyRedactedParsed);
+    }
+
     private static void assertComplexObjectEquals(
             SomeComplexObject expected,
             SomeComplexObject actual) {
@@ -186,6 +212,18 @@ public class TestGsonConfiguration {
     }
 
     @Test
+    public void testNoHtmlEscping() throws Exception {
+        SomeComplexObject obj = new SomeComplexObject();
+        obj.a = "<script>alert('boom!');</script>";
+
+        String json = Utils.toJsonHtml(obj);
+        assertTrue(json.contains(obj.a));
+
+        json = Utils.toJson(obj);
+        assertTrue(json.contains(obj.a));
+    }
+
+    @Test
     public void testBinaryEncodedToBase64() throws Exception {
         BinaryHolder instance = new BinaryHolder();
         instance.picture = "ssdfgsdgsdg".getBytes();
@@ -193,6 +231,17 @@ public class TestGsonConfiguration {
         String base64encoded = Base64.getEncoder().encodeToString(instance.picture);
         String json = Utils.toJson(instance);
         assertTrue(json.contains(base64encoded));
+    }
+
+
+    public static class AnnotatedDoc extends ServiceDocument {
+        public SomeComplexObject value;
+
+        @UsageOption(option = ServiceDocumentDescription.PropertyUsageOption.SENSITIVE)
+        public String sensitiveUsageOption;
+
+        @PropertyOptions(usage = {ServiceDocumentDescription.PropertyUsageOption.SENSITIVE})
+        public String sensitivePropertyOptions;
     }
 
     private static class SomeDocument1 extends ServiceDocument {

@@ -13,17 +13,34 @@
 
 package com.vmware.xenon.services.common;
 
+import java.util.Objects;
+
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.StatefulService;
+import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.services.common.QueryTask.Query;
 
 public class ResourceGroupService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS;
+
+    public static Service createFactory() {
+        // workaround for GSON issue https://github.com/google/gson/issues/764
+        // We serialize the complex type once, on service creation, to avoid possible GSON race
+        ResourceGroupState st = new ResourceGroupState();
+        st.query = QueryTask.Query.Builder.create().addFieldClause("one", "one").build();
+        Utils.toJson(st);
+        return FactoryService.createIdempotent(ResourceGroupService.class);
+    }
+
     /**
      * The {@link ResourceGroupState} holds a query that is used to represent a group of
-     * resources (services). {@link ResourceGroupState} and {@link UserGroupState) are used
-     * together in a {@link RoleState} to specify what resources a set of users has access to
+     * resources (services). {@link ResourceGroupState} and {@link UserGroupService.UserGroupState)
+     * are used together in a {@link AuthorizationContextService.Role} to specify what resources
+     * a set of users has access to.
      */
     public static class ResourceGroupState extends ServiceDocument {
         /**
@@ -45,6 +62,40 @@ public class ResourceGroupService extends StatefulService {
         super.toggleOption(ServiceOption.OWNER_SELECTION, true);
     }
 
+    public static class PatchQueryRequest {
+        public static final String KIND = Utils.buildKind(PatchQueryRequest.class);
+        public Query clause;
+        public boolean removeClause = false;
+        public String kind;
+
+        private PatchQueryRequest(Query clause, boolean removeClause) {
+            this.clause = clause;
+            this.removeClause = removeClause;
+            this.kind = KIND;
+        }
+
+        public static PatchQueryRequest create(Query clause, boolean removeClause) {
+            return new PatchQueryRequest(clause, removeClause);
+        }
+    }
+
+    @Override
+    public void handleRequest(Operation request, OperationProcessingStage opProcessingStage) {
+        if (request.getAction() == Action.DELETE || request.getAction() == Action.PUT) {
+            ResourceGroupState resourceGroupState;
+            if (request.isFromReplication() && request.hasBody()) {
+                resourceGroupState = getBody(request);
+            } else {
+                resourceGroupState = getState(request);
+            }
+            if (resourceGroupState != null) {
+                AuthorizationCacheUtils
+                        .clearAuthzCacheForResourceGroup(this, request, resourceGroupState);
+            }
+        }
+        super.handleRequest(request, opProcessingStage);
+    }
+
     @Override
     public void handleStart(Operation op) {
         if (!op.hasBody()) {
@@ -56,7 +107,6 @@ public class ResourceGroupService extends StatefulService {
         if (!validate(op, state)) {
             return;
         }
-
         op.complete();
     }
 
@@ -73,13 +123,37 @@ public class ResourceGroupService extends StatefulService {
         }
 
         ResourceGroupState currentState = getState(op);
-        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
             op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
         } else {
             setState(op, newState);
         }
+        op.complete();
+    }
 
+    @Override
+    public void handlePatch(Operation op) {
+        if (!op.hasBody()) {
+            op.fail(new IllegalArgumentException("body is required"));
+            return;
+        }
+        ResourceGroupState currentState = getState(op);
+        PatchQueryRequest patchQuery = op.getBody(PatchQueryRequest.class);
+        if (!Objects.equals(patchQuery.kind, PatchQueryRequest.KIND)) {
+            op.fail(new IllegalArgumentException("kind should be : " + PatchQueryRequest.KIND));
+            return;
+        }
+        if (patchQuery.clause == null) {
+            op.fail(new IllegalArgumentException("clause is required"));
+            return;
+        }
+        if (patchQuery.removeClause) {
+            AuthorizationCacheUtils.removeBooleanClause(currentState.query, patchQuery.clause);
+        } else {
+            currentState.query.addBooleanClause(patchQuery.clause);
+        }
+        op.setBody(currentState);
         op.complete();
     }
 
@@ -88,7 +162,6 @@ public class ResourceGroupService extends StatefulService {
             op.fail(new IllegalArgumentException("query is required"));
             return false;
         }
-
         return true;
     }
 }

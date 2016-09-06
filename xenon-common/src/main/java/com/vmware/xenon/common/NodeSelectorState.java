@@ -16,4 +16,6 @@ package com.vmware.xenon.common;
 public class NodeSelectorState extends ServiceDocument {
     public String nodeGroupLink;
     public Long replicationFactor;
+    public int membershipQuorum;
+    public long membershipUpdateTimeMicros;
 }

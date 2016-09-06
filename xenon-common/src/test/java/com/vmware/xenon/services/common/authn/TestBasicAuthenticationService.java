@@ -13,24 +13,34 @@
 
 package com.vmware.xenon.services.common.authn;
 
-import java.net.URI;
-import java.util.Base64;
-import java.util.HashMap;
-import java.util.Map;
-
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+
+import static com.vmware.xenon.services.common.authn.BasicAuthenticationUtils.constructBasicAuth;
+
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.Before;
 import org.junit.Test;
 
 import com.vmware.xenon.common.BasicTestCase;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Operation.AuthorizationContext;
+import com.vmware.xenon.common.ServiceStateCollectionUpdateRequest;
 import com.vmware.xenon.common.UriUtils;
+import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.common.http.netty.CookieJar;
 import com.vmware.xenon.common.test.VerificationHost;
-import com.vmware.xenon.services.common.AuthCredentialsFactoryService;
+import com.vmware.xenon.services.common.AuthCredentialsService;
 import com.vmware.xenon.services.common.AuthCredentialsService.AuthCredentialsServiceState;
-import com.vmware.xenon.services.common.UserFactoryService;
+import com.vmware.xenon.services.common.UserService;
 import com.vmware.xenon.services.common.UserService.UserState;
 import com.vmware.xenon.services.common.authn.AuthenticationRequest.AuthenticationRequestType;
 
@@ -40,7 +50,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
     private static final String PASSWORD = "password-for-jane";
     private static final String INVALID_PASSWORD = "invalid-password";
     private static final String BASIC_AUTH_PREFIX = "Basic ";
-    private static final String BASIC_AUTH_USER_SEPERATOR = ":";
+    private static final String BASIC_AUTH_USER_SEPARATOR = ":";
     private static final String SET_COOKIE_HEADER = "Set-Cookie";
 
     private String credentialsServiceStateSelfLink;
@@ -54,9 +64,9 @@ public class TestBasicAuthenticationService extends BasicTestCase {
     public void setUp() throws Exception {
         try {
             this.host.setSystemAuthorizationContext();
-            this.host.waitForServiceAvailable(AuthCredentialsFactoryService.SELF_LINK);
+            this.host.waitForServiceAvailable(AuthCredentialsService.FACTORY_LINK);
             this.host.waitForServiceAvailable(BasicAuthenticationService.SELF_LINK);
-            this.host.waitForServiceAvailable(UserFactoryService.SELF_LINK);
+            this.host.waitForServiceAvailable(UserService.FACTORY_LINK);
 
             // initialize users
             UserState state = new UserState();
@@ -65,7 +75,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
             authServiceState.userEmail = USER;
             authServiceState.privateKey = PASSWORD;
 
-            URI userUri = UriUtils.buildUri(this.host, UserFactoryService.SELF_LINK);
+            URI userUri = UriUtils.buildUri(this.host, UserService.FACTORY_LINK);
             Operation userOp = Operation.createPost(userUri)
                     .setBody(state)
                     .setCompletion((o, e) -> {
@@ -75,7 +85,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                         }
                         this.host.completeIteration();
                     });
-            URI authUri = UriUtils.buildUri(this.host, AuthCredentialsFactoryService.SELF_LINK);
+            URI authUri = UriUtils.buildUri(this.host, AuthCredentialsService.FACTORY_LINK);
             Operation authOp = Operation.createPost(authUri)
                     .setBody(authServiceState)
                     .setCompletion((o, e) -> {
@@ -119,10 +129,10 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                                     }
                                     String authHeader = o
                                             .getResponseHeader(
-                                                    BasicAuthenticationService.WWW_AUTHENTICATE_HEADER_NAME);
+                                                    BasicAuthenticationUtils.WWW_AUTHENTICATE_HEADER_NAME);
                                     if (authHeader == null
                                             || !authHeader
-                                                    .equals(BasicAuthenticationService.WWW_AUTHENTICATE_HEADER_VALUE)) {
+                                                    .equals(BasicAuthenticationUtils.WWW_AUTHENTICATE_HEADER_VALUE)) {
                                         this.host.failIteration(new IllegalStateException(
                                                 "Invalid status code returned"));
                                         return;
@@ -132,15 +142,12 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.testWait();
 
         // send a request with an authentication header for an invalid user
-        String userPassStr = new String(Base64.getEncoder().encode(
-                new StringBuffer(INVALID_USER).append(BASIC_AUTH_USER_SEPERATOR).append(PASSWORD)
-                        .toString().getBytes()));
-        String headerVal = new StringBuffer("Basic ").append(userPassStr).toString();
+        String headerVal = constructBasicAuth(INVALID_USER, PASSWORD);
         this.host.testStart(1);
         this.host.send(Operation
                 .createPost(authServiceUri)
                 .setBody(new Object())
-                .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e == null) {
@@ -158,14 +165,14 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.testWait();
 
         // send a request with a malformed authentication header
-        userPassStr = new String(Base64.getEncoder().encode(
+        String userPassStr = new String(Base64.getEncoder().encode(
                 new StringBuffer(USER).toString().getBytes()));
         headerVal = new StringBuffer(BASIC_AUTH_PREFIX).append(userPassStr).toString();
         this.host.testStart(1);
         this.host.send(Operation
                 .createPost(authServiceUri)
                 .setBody(new Object())
-                .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e == null) {
@@ -183,15 +190,12 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.testWait();
 
         // send a request with an invalid password
-        userPassStr = new String(Base64.getEncoder().encode(
-                new StringBuffer(USER).append(BASIC_AUTH_USER_SEPERATOR).append(INVALID_PASSWORD)
-                        .toString().getBytes()));
-        headerVal = new StringBuffer(BASIC_AUTH_PREFIX).append(userPassStr).toString();
+        headerVal = constructBasicAuth(USER, INVALID_PASSWORD);
         this.host.testStart(1);
         this.host.send(Operation
                 .createPost(authServiceUri)
                 .setBody(new Object())
-                .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e == null) {
@@ -209,15 +213,12 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.testWait();
 
         // Next send a valid request
-        userPassStr = new String(Base64.getEncoder().encode(
-                new StringBuffer(USER).append(BASIC_AUTH_USER_SEPERATOR).append(PASSWORD)
-                        .toString().getBytes()));
-        headerVal = new StringBuffer(BASIC_AUTH_PREFIX).append(userPassStr).toString();
+        headerVal = constructBasicAuth(USER, PASSWORD);
         this.host.testStart(1);
         this.host.send(Operation
                 .createPost(authServiceUri)
                 .setBody(new Object())
-                .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e != null) {
@@ -276,7 +277,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                 .createPost(authServiceUri)
                 .setBody(new Object())
                 .forceRemote()
-                .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e != null) {
@@ -298,7 +299,141 @@ public class TestBasicAuthenticationService extends BasicTestCase {
     }
 
     @Test
-    public void testCustomProperties() throws Throwable {
+    public void testAuthExpiration() throws Throwable {
+        this.host.resetAuthorizationContext();
+        URI authServiceUri = UriUtils.buildUri(this.host, BasicAuthenticationService.SELF_LINK);
+
+        // Next send a valid request
+        String headerVal = constructBasicAuth(USER, PASSWORD);
+
+        long oneHourFromNowBeforeAuth = Utils.getNowMicrosUtc() + TimeUnit.HOURS.toMicros(1);
+
+        // do not specify expiration
+        AuthenticationRequest authReq = new AuthenticationRequest();
+
+        this.host.testStart(1);
+        this.host.send(Operation
+                .createPost(authServiceUri)
+                .setBody(authReq)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+
+                            long oneHourFromNowAfterAuth =
+                                    Utils.getNowMicrosUtc() + TimeUnit.HOURS.toMicros(1);
+
+                            // default expiration(1hour) must be used
+                            validateExpirationTimeRange(o.getAuthorizationContext(),
+                                    oneHourFromNowBeforeAuth, oneHourFromNowAfterAuth);
+
+                            this.host.completeIteration();
+                        }));
+        this.host.testWait();
+
+        // set expiration 1min
+        authReq = new AuthenticationRequest();
+        authReq.sessionExpirationSeconds = 60L;
+
+        this.host.testStart(1);
+        this.host.send(Operation
+                .createPost(authServiceUri)
+                .setBody(authReq)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+
+                            long tenMinAfterNowInMicro =
+                                    Utils.getNowMicrosUtc() + TimeUnit.MINUTES.toMicros(10);
+
+                            // expiration has set to 1min, so it must be before now + 10min
+                            validateExpirationTimeRange(o.getAuthorizationContext(),
+                                    null, tenMinAfterNowInMicro);
+
+                            this.host.completeIteration();
+                        }));
+        this.host.testWait();
+
+        // with negative sec
+        authReq = new AuthenticationRequest();
+        authReq.sessionExpirationSeconds = -1L;
+
+        this.host.testStart(1);
+        this.host.send(Operation
+                .createPost(authServiceUri)
+                .setBody(authReq)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+
+                            // must be before now
+                            validateExpirationTimeRange(o.getAuthorizationContext(),
+                                    null, Utils.getNowMicrosUtc());
+
+                            this.host.completeIteration();
+                        }));
+        this.host.testWait();
+
+        // with 0
+        authReq = new AuthenticationRequest();
+        authReq.sessionExpirationSeconds = 0L;
+
+        this.host.testStart(1);
+        this.host.send(Operation
+                .createPost(authServiceUri)
+                .setBody(authReq)
+                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+
+                            // must be before now
+                            validateExpirationTimeRange(o.getAuthorizationContext(),
+                                    null, Utils.getNowMicrosUtc());
+
+                            this.host.completeIteration();
+                        }));
+        this.host.testWait();
+
+    }
+
+    private void validateExpirationTimeRange(AuthorizationContext authContext, Long fromInMicro,
+            Long toInMicro) {
+        assertNotNull(authContext);
+        assertNotNull(authContext.getClaims());
+        assertNotNull(authContext.getClaims().getExpirationTime());
+        long expirationInMicro = authContext.getClaims().getExpirationTime();
+
+        if (fromInMicro != null && expirationInMicro <= fromInMicro) {
+            String msg = String.format("expiration must be greater than %d but was %d", fromInMicro,
+                    expirationInMicro);
+            this.host.failIteration(new IllegalStateException(msg));
+        }
+
+        if (toInMicro != null && toInMicro <= expirationInMicro) {
+            String msg = String.format("expiration must be greater less %d but was %d", toInMicro,
+                    expirationInMicro);
+            this.host.failIteration(new IllegalStateException(msg));
+        }
+
+    }
+
+    @Test
+    public void testCustomPropertiesAndTenantLinks() throws Throwable {
         String firstProperty = "Property1";
         String firstValue = "Value1";
         String secondProperty = "Property2";
@@ -348,6 +483,120 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.testStart(1);
         this.host.send(updateProperies);
         this.host.testWait();
+
+        // update tenantLinks via a CollectionsPatchRequest
+        List<String> tenantLinks = new ArrayList<>();
+        tenantLinks.add("foo");
+        Map<String, Collection<Object>> itemsToAdd = new HashMap<>();
+        itemsToAdd.put("tenantLinks", new ArrayList<>(tenantLinks));
+        ServiceStateCollectionUpdateRequest patchRequest = ServiceStateCollectionUpdateRequest.create(itemsToAdd, null) ;
+        updateProperies = Operation.createPatch(authUri)
+                .setBody(patchRequest)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        this.host.failIteration(e);
+                        return;
+                    }
+                    AuthCredentialsServiceState state = o.getBody(AuthCredentialsServiceState.class);
+                    assertEquals("There should be one tenantLink", state.tenantLinks.size(), 1);
+                    this.host.completeIteration();
+                });
+        this.host.testStart(1);
+        this.host.send(updateProperies);
+        this.host.testWait();
+
+        // remove the tenantLink
+        Map<String, Collection<Object>> itemsToRemove = new HashMap<>();
+        itemsToRemove.put("tenantLinks", new ArrayList<>(tenantLinks));
+        patchRequest = ServiceStateCollectionUpdateRequest.create(null, itemsToRemove) ;
+        updateProperies = Operation.createPatch(authUri)
+                .setBody(patchRequest)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        this.host.failIteration(e);
+                        return;
+                    }
+                    AuthCredentialsServiceState state = o.getBody(AuthCredentialsServiceState.class);
+                    assertEquals("There should be no tenantLink", state.tenantLinks.size(), 0);
+                    this.host.completeIteration();
+                });
+        this.host.testStart(1);
+        this.host.send(updateProperies);
+        this.host.testWait();
+    }
+
+    @Test
+    public void testAuthWithUserInfo() throws Throwable {
+        doTestAuthWithUserInfo(false);
+        doTestAuthWithUserInfo(true);
+    }
+
+    private void doTestAuthWithUserInfo(boolean remote) throws Throwable {
+        this.host.resetAuthorizationContext();
+        String userPassStr = new StringBuilder(USER).append(BASIC_AUTH_USER_SEPARATOR).append(PASSWORD)
+                .toString();
+        URI authServiceUri = UriUtils.buildUri(this.host, BasicAuthenticationService.SELF_LINK, null, userPassStr);
+
+        this.host.testStart(1);
+        Operation post = Operation.createPost(authServiceUri)
+                .setBody(new Object())
+                .setCompletion(
+                    (o, e) -> {
+                        if (e != null) {
+                            this.host.failIteration(e);
+                            return;
+                        }
+                        if (o.getStatusCode() != Operation.STATUS_CODE_OK) {
+                            this.host.failIteration(new IllegalStateException(
+                                    "Invalid status code returned"));
+                            return;
+                        }
+                        if (!o.isRemote() && o.getAuthorizationContext() == null) {
+                            this.host.failIteration(new IllegalStateException(
+                                    "Authorization context not set"));
+                            return;
+                        }
+                        // now issue a logout
+                        AuthenticationRequest request = new AuthenticationRequest();
+                        request.requestType = AuthenticationRequestType.LOGOUT;
+                        Operation logoutOp = Operation
+                                .createPost(authServiceUri)
+                                .setBody(request)
+                                .forceRemote()
+                                .setCompletion(
+                                        (oo, ee) -> {
+                                            if (ee != null) {
+                                                this.host.failIteration(ee);
+                                                return;
+                                            }
+                                            if (oo.getStatusCode() != Operation.STATUS_CODE_OK) {
+                                                this.host.failIteration(new IllegalStateException(
+                                                        "Invalid status code returned"));
+                                                return;
+                                            }
+                                            String cookieHeader = oo.getResponseHeader(SET_COOKIE_HEADER);
+                                            if (cookieHeader == null) {
+                                                this.host.failIteration(new IllegalStateException(
+                                                        "Cookie is null"));
+                                            }
+                                            Map<String, String> cookieElements = CookieJar.decodeCookies(cookieHeader);
+                                            if (!cookieElements.get("Max-Age").equals("0")) {
+                                                this.host.failIteration(new IllegalStateException(
+                                                        "Max-Age for cookie is not zero"));
+                                            }
+                                            this.host.resetAuthorizationContext();
+                                            this.host.completeIteration();
+                                        });
+                        this.host.setAuthorizationContext(o.getAuthorizationContext());
+                        this.host.send(logoutOp);
+                        });
+
+        if (remote) {
+            post.forceRemote();
+        }
+
+        this.host.send(post);
+        this.host.testWait();
     }
 
     private boolean validateAuthToken(Operation op) {
@@ -358,7 +607,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         }
 
         Map<String, String> cookieElements = CookieJar.decodeCookies(cookieHeader);
-        if (!cookieElements.containsKey(AuthenticationConstants.XENON_JWT_COOKIE)) {
+        if (!cookieElements.containsKey(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE)) {
             this.host.failIteration(new IllegalStateException("Missing auth cookie"));
             return false;
         }
@@ -368,7 +617,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
             return false;
         }
 
-        String authCookie = cookieElements.get(AuthenticationConstants.XENON_JWT_COOKIE);
+        String authCookie = cookieElements.get(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE);
         String authToken = op.getResponseHeader(Operation.REQUEST_AUTH_TOKEN_HEADER);
 
         if (!authCookie.equals(authToken)) {

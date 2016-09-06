@@ -15,8 +15,7 @@ package com.vmware.xenon.common;
 
 import java.net.URI;
 import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.EnumSet;
 import java.util.logging.Level;
 
 import com.vmware.xenon.common.Service.Action;
@@ -75,6 +74,28 @@ import com.vmware.xenon.services.common.UserService.UserState;
  * As a note on the limitations: this user doesn't have access to modify their
  * credentials, only documents of type ExampleServiceState
  *
+ * To only create a role for a stateless service using well known group and role names:
+ *
+ *  AuthorizationSetupHelper.create()
+ *         .setHost(this)
+ *         .setUserSelfLink(ServiceUriPaths.CORE_AUTHZ_GUEST_USER)
+ *         .setDocumentLink(ServiceUriPaths.SWAGGER)
+ *         .setUserGroupName(GUEST_USER_GROUP)
+ *         .setResourceGroupName(GUEST_RESOURCE_GROUP)
+ *         .setRoleName(GUEST_ROLE)
+ *         .setCompletion(authCompletion)
+ *         .setupRole();
+ *
+ * To only create a role for a stateless service using user and resource group queries:
+ *
+ *  AuthorizationSetupHelper.create()
+ *         .setHost(this)
+ *         .setUserGroupQuery(userQuery)
+ *         .setResourceQuery(resourceQuery)
+ *         .setRoleName(GUEST_ROLE)
+ *         .setCompletion(authCompletion)
+ *         .setupRole();
+ *
  */
 public class AuthorizationSetupHelper {
 
@@ -84,7 +105,7 @@ public class AuthorizationSetupHelper {
     }
 
     /**
-     * The steps we follow in order to fully create a user. See {@link setupUser} for details
+     * The steps we follow in order to fully create a user. See {@link #setupUser} for details
      */
     private enum UserCreationStep {
         QUERY_USER, MAKE_USER, MAKE_CREDENTIALS, MAKE_USER_GROUP, MAKE_RESOURCE_GROUP, MAKE_ROLE, SUCCESS, FAILURE
@@ -104,6 +125,9 @@ public class AuthorizationSetupHelper {
     private String userGroupSelfLink;
     private String resourceGroupSelfLink;
     private String roleSelfLink;
+    private Query userGroupQuery;
+    private Query resourceQuery;
+    private EnumSet<Action> verbs;
 
     private String failureMessage;
 
@@ -118,6 +142,11 @@ public class AuthorizationSetupHelper {
 
     public AuthorizationSetupHelper setUserPassword(String userPassword) {
         this.userPassword = userPassword;
+        return this;
+    }
+
+    public AuthorizationSetupHelper setUserSelfLink(String userSelfLink) {
+        this.userSelfLink = userSelfLink;
         return this;
     }
 
@@ -147,10 +176,47 @@ public class AuthorizationSetupHelper {
         return this;
     }
 
+    public AuthorizationSetupHelper setUserGroupQuery(Query userGroupQuery) {
+        this.userGroupQuery = userGroupQuery;
+        return this;
+    }
+
+    public AuthorizationSetupHelper setResourceQuery(Query resourceQuery) {
+        this.resourceQuery = resourceQuery;
+        return this;
+    }
+
+    public AuthorizationSetupHelper setVerbs(EnumSet<Action> verbs) {
+        this.verbs = verbs;
+        return this;
+    }
+
+    public AuthorizationSetupHelper setUserGroupName(String userGroupName) {
+        this.userGroupSelfLink = userGroupName;
+        return this;
+    }
+
+    public AuthorizationSetupHelper setResourceGroupName(String resourceGroupName) {
+        this.resourceGroupSelfLink = resourceGroupName;
+        return this;
+    }
+
+    public AuthorizationSetupHelper setRoleName(String roleName) {
+        this.roleSelfLink = roleName;
+        return this;
+    }
+
     public AuthorizationSetupHelper start() {
         validate();
         this.currentStep = UserCreationStep.QUERY_USER;
         this.setupUser();
+        return this;
+    }
+
+    public AuthorizationSetupHelper setupRole() {
+        validateForRoleSetup();
+        this.currentStep = UserCreationStep.MAKE_USER_GROUP;
+        this.makeUserGroup();
         return this;
     }
 
@@ -165,6 +231,34 @@ public class AuthorizationSetupHelper {
             throw new IllegalStateException("Missing host");
         }
         if (!this.isAdmin && (this.documentKind == null && this.documentLink == null)) {
+            throw new IllegalStateException("User has access to nothing");
+        }
+    }
+
+    private void validateForRoleSetup() {
+        if (this.host == null) {
+            throw new IllegalStateException("Missing host");
+        }
+
+        if (this.userEmail != null || this.userPassword != null) {
+            throw new IllegalStateException(
+                    "User email and password are not required during role setup");
+        }
+
+        // We need the user or user group query for user group setup.
+        if (this.userGroupQuery == null && this.userSelfLink == null) {
+            throw new IllegalStateException("No user specified");
+        }
+
+        // We need the user when we want to setup resource group based on document kind for
+        // non admin users.
+        if (this.resourceQuery == null && !this.isAdmin && this.documentKind != null
+                && this.userSelfLink == null) {
+            throw new IllegalStateException("No user specified");
+        }
+
+        if (this.resourceQuery == null && !this.isAdmin && (this.documentKind == null
+                && this.documentLink == null)) {
             throw new IllegalStateException("User has access to nothing");
         }
     }
@@ -246,6 +340,9 @@ public class AuthorizationSetupHelper {
                     }
                     this.host.log(Level.INFO, "User %s already exists, skipping setup of user",
                             this.userEmail);
+                    if (this.completion != null) {
+                        this.completion.handle(null);
+                    }
                 });
         this.host.sendRequest(postQuery);
     }
@@ -258,6 +355,9 @@ public class AuthorizationSetupHelper {
     private void makeUser() {
         UserState user = new UserState();
         user.email = this.userEmail;
+        if (this.userSelfLink != null) {
+            user.documentSelfLink = this.userSelfLink;
+        }
 
         URI userFactoryUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_USERS);
         Operation postUser = Operation.createPost(userFactoryUri)
@@ -276,6 +376,7 @@ public class AuthorizationSetupHelper {
                     this.currentStep = UserCreationStep.MAKE_CREDENTIALS;
                     setupUser();
                 });
+        addReplicationFactor(postUser);
         this.host.sendRequest(postUser);
     }
 
@@ -303,18 +404,28 @@ public class AuthorizationSetupHelper {
                     this.currentStep = UserCreationStep.MAKE_USER_GROUP;
                     setupUser();
                 });
+        addReplicationFactor(postCreds);
         this.host.sendRequest(postCreds);
     }
 
     /**
-     * Make a user group that contains just this user
+     * Make a user group that contains just the created user or the given user or the given user
+     * group query.
      */
     private void makeUserGroup() {
-        Query userQuery = Query.Builder.create()
-                .setTerm(ServiceDocument.FIELD_NAME_SELF_LINK, this.userSelfLink)
-                .build();
+        Query userGroupQuery;
+
+        if (this.userGroupQuery == null) {
+            userGroupQuery = Query.Builder.create()
+                    .setTerm(ServiceDocument.FIELD_NAME_SELF_LINK, this.userSelfLink)
+                    .build();
+        } else {
+            userGroupQuery = this.userGroupQuery;
+        }
+
         UserGroupState group = new UserGroupState();
-        group.query = userQuery;
+        group.query = userGroupQuery;
+        group.documentSelfLink = this.userGroupSelfLink;
 
         URI userGroupFactoryUri = UriUtils.buildUri(this.host,
                 ServiceUriPaths.CORE_AUTHZ_USER_GROUPS);
@@ -335,6 +446,7 @@ public class AuthorizationSetupHelper {
                     this.currentStep = UserCreationStep.MAKE_RESOURCE_GROUP;
                     setupUser();
                 });
+        addReplicationFactor(postGroup);
         this.host.sendRequest(postGroup);
     }
 
@@ -347,6 +459,8 @@ public class AuthorizationSetupHelper {
      *
      * For non-administrative users, we'll make a resource group that allows access
      * to documents of a single type that are owned by the user
+     *
+     * If a resource query is set, then it takes precedence over other parameters.
      */
     private void makeResourceGroup() {
         /* A resource group is a query that will return the set of resources in the group
@@ -355,35 +469,41 @@ public class AuthorizationSetupHelper {
          */
         Query resourceQuery = null;
 
-        if (this.isAdmin) {
-            resourceQuery = Query.Builder.create()
-                    .setTerm(ServiceDocument.FIELD_NAME_SELF_LINK, UriUtils.URI_WILDCARD_CHAR,
-                            QueryTerm.MatchType.WILDCARD)
-                    .build();
-        } else if (this.documentKind != null) {
-            resourceQuery = Query.Builder.create()
-                    .addFieldClause(ServiceDocument.FIELD_NAME_AUTH_PRINCIPAL_LINK,
-                            this.userSelfLink)
-                    .addFieldClause(ServiceDocument.FIELD_NAME_KIND, this.documentKind)
-                    .build();
-        } else if (this.documentLink != null) {
-            if (this.documentLink.contains(UriUtils.URI_WILDCARD_CHAR)) {
+        if (this.resourceQuery == null) {
+            if (this.isAdmin) {
                 resourceQuery = Query.Builder.create()
-                        .setTerm(ServiceDocument.FIELD_NAME_SELF_LINK, this.documentLink,
+                        .setTerm(ServiceDocument.FIELD_NAME_SELF_LINK, UriUtils.URI_WILDCARD_CHAR,
                                 QueryTerm.MatchType.WILDCARD)
                         .build();
-            } else {
+            } else if (this.documentKind != null) {
                 resourceQuery = Query.Builder.create()
-                        .addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK,
-                                this.documentLink)
+                        .addFieldClause(ServiceDocument.FIELD_NAME_AUTH_PRINCIPAL_LINK,
+                                this.userSelfLink)
+                        .addFieldClause(ServiceDocument.FIELD_NAME_KIND, this.documentKind)
                         .build();
+            } else if (this.documentLink != null) {
+                if (this.documentLink.contains(UriUtils.URI_WILDCARD_CHAR)) {
+                    resourceQuery = Query.Builder.create()
+                            .setTerm(ServiceDocument.FIELD_NAME_SELF_LINK, this.documentLink,
+                                    QueryTerm.MatchType.WILDCARD)
+                            .build();
+                } else {
+                    resourceQuery = Query.Builder.create()
+                            .addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK,
+                                    this.documentLink)
+                            .build();
+                }
+            } else {
+                // this branch is not possible, we validate earlier that one of the fields above
+                // is properly configured
             }
         } else {
-            // this branch is not possible, we validate earlier that one of the fields above
-            // is properly configured
+            resourceQuery = this.resourceQuery;
         }
+
         ResourceGroupState group = new ResourceGroupState();
         group.query = resourceQuery;
+        group.documentSelfLink = this.resourceGroupSelfLink;
 
         URI resourceGroupFactoryUri = UriUtils.buildUri(this.host,
                 ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS);
@@ -404,26 +524,29 @@ public class AuthorizationSetupHelper {
                     this.currentStep = UserCreationStep.MAKE_ROLE;
                     setupUser();
                 });
+        addReplicationFactor(postGroup);
         this.host.sendRequest(postGroup);
     }
 
     /**
-     * Make the role that ties together the user group and resource group. Our policy is to
-     * allow all verbose (PUT, POST, etc)
+     * Make the role that ties together the user group and resource group.
+     * If no verbs are specified, allow all verbs (PUT, POST, etc)
      */
     private void makeRole() {
-        Set<Action> verbs = new HashSet<>();
-        Collections.addAll(verbs, Action.values());
+        if (this.verbs == null) {
+            this.verbs = EnumSet.allOf(Action.class);
+            Collections.addAll(this.verbs, Action.values());
+        }
 
         RoleState role = new RoleState();
         role.userGroupLink = this.userGroupSelfLink;
         role.resourceGroupLink = this.resourceGroupSelfLink;
-        role.verbs = verbs;
+        role.verbs = this.verbs;
         role.policy = Policy.ALLOW;
+        role.documentSelfLink = this.roleSelfLink;
 
-        URI resourceGroupFactoryUri = UriUtils.buildUri(this.host,
-                ServiceUriPaths.CORE_AUTHZ_ROLES);
-        Operation postGroup = Operation.createPost(resourceGroupFactoryUri)
+        URI roleFactoryUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_ROLES);
+        Operation postRole = Operation.createPost(roleFactoryUri)
                 .setBody(role)
                 .setReferer(this.referer)
                 .setCompletion((op, ex) -> {
@@ -439,21 +562,41 @@ public class AuthorizationSetupHelper {
                     this.currentStep = UserCreationStep.SUCCESS;
                     setupUser();
                 });
-        this.host.sendRequest(postGroup);
+        addReplicationFactor(postRole);
+        this.host.sendRequest(postRole);
+    }
+
+    /**
+     * Authorization related operations should take effect on all replicas, before they
+     * complete. This method adds a special header that sets the quorum level to all
+     * available nodes, avoiding a race where a client can reach a node that has not yet
+     * received latest authorization changes, even if it received success from this auth
+     * helper class
+     */
+    private void addReplicationFactor(Operation op) {
+        op.addRequestHeader(Operation.REPLICATION_QUORUM_HEADER,
+                Operation.REPLICATION_QUORUM_HEADER_VALUE_ALL);
     }
 
     /**
      * When we complete the process, log the full details of the user
      */
     private void printUserDetails() {
-        this.host.log(Level.INFO,
-                "Created user %s (%s) with credentials, user group (%s) "
-                        + "resource group (%s) and role(%s)",
-                this.userEmail,
-                this.userSelfLink,
-                this.userGroupSelfLink,
-                this.resourceGroupSelfLink,
-                this.roleSelfLink);
+        if (this.userEmail != null) {
+            this.host.log(Level.INFO,
+                    "Created user %s (%s) with credentials, user group (%s) "
+                            + "resource group (%s) and role(%s)",
+                    this.userEmail,
+                    this.userSelfLink,
+                    this.userGroupSelfLink,
+                    this.resourceGroupSelfLink,
+                    this.roleSelfLink);
+        } else {
+            this.host.log(Level.INFO, "Created user group (%s) resource group (%s) and role (%s)",
+                    this.userGroupSelfLink,
+                    this.resourceGroupSelfLink,
+                    this.roleSelfLink);
+        }
         if (this.completion != null) {
             this.completion.handle(null);
         }
